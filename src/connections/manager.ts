@@ -67,7 +67,7 @@ export default class ConnectionManager implements IConnectionManager {
 
     client.on('error', (err) => {
       invalidateIfCurrent();
-      void mcpLog(
+      mcpLog(
         'error',
         'imap',
         `Connection error for "${accountName}": ${err instanceof Error ? err.message : String(err)}`,

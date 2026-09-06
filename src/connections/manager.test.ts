@@ -2,14 +2,14 @@ import type { AccountConfig } from '../types/index.js';
 import ConnectionManager from './manager.js';
 
 type MockListener = (...args: unknown[]) => void;
-type MockClient = {
+interface MockClient {
   usable: boolean;
   connect: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
   logout: ReturnType<typeof vi.fn>;
   on: (event: string, listener: MockListener) => MockClient;
   emit: (event: string, ...args: unknown[]) => boolean;
-};
+}
 
 const imapInstances = vi.hoisted(() => [] as MockClient[]);
 
