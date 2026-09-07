@@ -9,7 +9,9 @@ import type Mail from 'nodemailer/lib/mailer/index.js';
 
 import type { IConnectionManager } from '../connections/types.js';
 import type RateLimiter from '../safety/rate-limiter.js';
-import type { SendResult } from '../types/index.js';
+import { MAX_ATTACHMENT_SIZE, validateAttachments } from '../safety/validation.js';
+import type { AttachmentInput, SendResult } from '../types/index.js';
+import { resolveAttachments } from '../utils/mail-attachments.js';
 import type ImapService from './imap.service.js';
 
 export default class SmtpService {
@@ -32,11 +34,15 @@ export default class SmtpService {
       cc?: string[];
       bcc?: string[];
       html?: boolean;
+      attachments?: AttachmentInput[];
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
+    await validateAttachments(options.attachments);
 
     const account = this.connections.getAccount(accountName);
+    // dispatch() opens the transport itself; only the attachments are needed here.
+    const attachments = await resolveAttachments(options.attachments);
 
     return this.dispatch(accountName, {
       from: account.fullName ? `"${account.fullName}" <${account.email}>` : account.email,
@@ -44,6 +50,7 @@ export default class SmtpService {
       cc: options.cc?.join(', '),
       bcc: options.bcc?.join(', '),
       subject: options.subject,
+      attachments,
       ...(options.html ? { html: options.body } : { text: options.body }),
     });
   }
@@ -60,9 +67,11 @@ export default class SmtpService {
       body: string;
       replyAll?: boolean;
       html?: boolean;
+      attachments?: AttachmentInput[];
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
+    await validateAttachments(options.attachments);
 
     const account = this.connections.getAccount(accountName);
     const original = await this.imapService.getEmail(accountName, options.emailId, options.mailbox);
@@ -93,6 +102,8 @@ export default class SmtpService {
       ? original.subject
       : `Re: ${original.subject}`;
 
+    const attachments = await resolveAttachments(options.attachments);
+
     return this.dispatch(accountName, {
       from: account.fullName ? `"${account.fullName}" <${account.email}>` : account.email,
       to: to.join(', '),
@@ -100,6 +111,7 @@ export default class SmtpService {
       subject,
       inReplyTo: original.messageId,
       references: references.join(' '),
+      attachments,
       ...(options.html ? { html: options.body } : { text: options.body }),
     });
   }
@@ -116,12 +128,16 @@ export default class SmtpService {
       to: string[];
       body?: string;
       cc?: string[];
+      attachments?: AttachmentInput[];
+      includeOriginalAttachments?: boolean;
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
+    await validateAttachments(options.attachments);
 
     const account = this.connections.getAccount(accountName);
-    const original = await this.imapService.getEmail(accountName, options.emailId, options.mailbox);
+    const mailbox = options.mailbox ?? 'INBOX';
+    const original = await this.imapService.getEmail(accountName, options.emailId, mailbox);
 
     const subject = original.subject.startsWith('Fwd:')
       ? original.subject
@@ -141,12 +157,41 @@ export default class SmtpService {
     const originalBody = original.bodyText ?? original.bodyHtml ?? '';
     const fullBody = (options.body ?? '') + forwardHeader + originalBody;
 
+    const userAttachments = (await resolveAttachments(options.attachments)) ?? [];
+
+    let originalAttachments: { filename: string; content: Buffer; contentType: string }[] = [];
+    if (options.includeOriginalAttachments && original.attachments.length > 0) {
+      const totalOriginalSize = original.attachments.reduce((sum, a) => sum + a.size, 0);
+      if (totalOriginalSize > MAX_ATTACHMENT_SIZE) {
+        throw new Error(
+          `Original email's attachments (${Math.round(totalOriginalSize / 1024 / 1024)}MB) exceed the ${MAX_ATTACHMENT_SIZE / 1024 / 1024}MB per-file limit; forward without includeOriginalAttachments and attach selectively instead`,
+        );
+      }
+      originalAttachments = await Promise.all(
+        original.attachments.map(async (meta) => {
+          const downloaded = await this.imapService.downloadAttachment(
+            accountName,
+            options.emailId,
+            mailbox,
+            meta.filename,
+            MAX_ATTACHMENT_SIZE,
+          );
+          return {
+            filename: downloaded.filename,
+            content: Buffer.from(downloaded.contentBase64, 'base64'),
+            contentType: downloaded.mimeType,
+          };
+        }),
+      );
+    }
+
     return this.dispatch(accountName, {
       from: account.fullName ? `"${account.fullName}" <${account.email}>` : account.email,
       to: options.to.join(', '),
       cc: options.cc?.join(', '),
       subject,
       text: fullBody,
+      attachments: [...originalAttachments, ...userAttachments],
     });
   }
 
@@ -226,6 +271,23 @@ export default class SmtpService {
     const to = draft.to.map((a) => a.address).join(', ');
     const cc = draft.cc?.map((a) => a.address).join(', ');
 
+    const attachments = await Promise.all(
+      draft.attachments.map(async (meta) => {
+        const downloaded = await this.imapService.downloadAttachment(
+          accountName,
+          String(draftId),
+          draftsPath,
+          meta.filename,
+          MAX_ATTACHMENT_SIZE,
+        );
+        return {
+          filename: downloaded.filename,
+          content: Buffer.from(downloaded.contentBase64, 'base64'),
+          contentType: downloaded.mimeType,
+        };
+      }),
+    );
+
     const result = await this.dispatch(accountName, {
       from: account.fullName ? `"${account.fullName}" <${account.email}>` : account.email,
       to,
@@ -233,6 +295,7 @@ export default class SmtpService {
       subject: draft.subject,
       inReplyTo: draft.inReplyTo,
       references: draft.references?.join(' '),
+      attachments,
       ...(draft.bodyHtml ? { html: draft.bodyHtml } : { text: draft.bodyText ?? '' }),
     });
 

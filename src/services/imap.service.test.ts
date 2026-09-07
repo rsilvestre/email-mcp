@@ -18,7 +18,7 @@ function createMockImapClient() {
     messageDelete: vi.fn().mockResolvedValue(true),
     messageFlagsAdd: vi.fn().mockResolvedValue(true),
     messageFlagsRemove: vi.fn().mockResolvedValue(true),
-    append: vi.fn().mockResolvedValue({ uid: 7 }),
+    append: vi.fn().mockResolvedValue({ uid: 42 }),
     capabilities: new Set<string>(),
     _releaseFn: releaseFn,
   };
@@ -261,6 +261,65 @@ describe('ImapService', () => {
       await service.appendToSent('test', Buffer.from('raw'));
 
       expect(client.append).toHaveBeenCalledWith('Sent', expect.any(Buffer), ['\\Seen']);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // saveDraft
+  // -----------------------------------------------------------------------
+
+  describe('saveDraft', () => {
+    it('appends a plain RFC822 message when there are no attachments', async () => {
+      const result = await service.saveDraft('test', {
+        to: ['dest@example.com'],
+        subject: 'Hello',
+        body: 'World',
+      });
+
+      expect(result).toEqual({ id: 42, mailbox: 'Drafts' });
+      const [mailbox, raw, flags] = client.append.mock.calls[0];
+      expect(mailbox).toBe('Drafts');
+      expect(flags).toEqual(['\\Draft', '\\Seen']);
+      const text = (raw as Buffer).toString('utf-8');
+      expect(text).toContain('Subject: Hello');
+      expect(text).toContain('To: dest@example.com');
+      expect(text).toContain('World');
+    });
+
+    it('builds a multipart MIME message with the attachment when attachments are provided', async () => {
+      const result = await service.saveDraft('test', {
+        to: ['dest@example.com'],
+        subject: 'With attachment',
+        body: 'See attached',
+        attachments: [
+          {
+            filename: 'note.txt',
+            content: Buffer.from('hello').toString('base64'),
+            contentType: 'text/plain',
+          },
+        ],
+      });
+
+      expect(result).toEqual({ id: 42, mailbox: 'Drafts' });
+      const [, raw] = client.append.mock.calls[0];
+      const text = (raw as Buffer).toString('utf-8');
+      expect(text).toContain('multipart/mixed');
+      expect(text).toContain('Content-Disposition: attachment; filename=note.txt');
+      expect(text).toContain(Buffer.from('hello').toString('base64'));
+      expect(text).toContain('See attached');
+    });
+
+    it('rejects invalid attachments before appending', async () => {
+      await expect(
+        service.saveDraft('test', {
+          to: ['dest@example.com'],
+          subject: 'Bad',
+          body: 'oops',
+          attachments: [{ filename: 'note.txt' }],
+        }),
+      ).rejects.toThrow('exactly one of "content"');
+
+      expect(client.append).not.toHaveBeenCalled();
     });
   });
 });

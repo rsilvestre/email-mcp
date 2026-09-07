@@ -1,5 +1,17 @@
 /** Input validation and sanitization utilities. */
 
+import { realpath, stat } from 'node:fs/promises';
+import { basename, resolve } from 'node:path';
+
+import type { AttachmentInput } from '../types/index.js';
+
+/** Maximum number of attachments allowed on a single outgoing email. */
+export const MAX_ATTACHMENTS = 10;
+/** Maximum size of a single attachment, in bytes (25 MB). */
+export const MAX_ATTACHMENT_SIZE = 25 * 1024 * 1024;
+/** Maximum combined size of all attachments on a single email, in bytes (40 MB). */
+export const MAX_TOTAL_ATTACHMENTS_SIZE = 40 * 1024 * 1024;
+
 /**
  * Validate and sanitize an IMAP mailbox name.
  * Rejects names containing IMAP wildcard characters (`*`, `%`) or empty strings.
@@ -117,5 +129,123 @@ export function validateLabelName(name: string): string {
 export function validateInputLength(input: string, maxLength: number, fieldName: string): void {
   if (input.length > maxLength) {
     throw new Error(`${fieldName} exceeds maximum length of ${maxLength} characters`);
+  }
+}
+
+/** Decoded byte size of a base64 string, without allocating a Buffer. */
+function base64DecodedSize(base64: string): number {
+  const cleaned = base64.replace(/\s/g, '');
+  let padding = 0;
+  if (cleaned.endsWith('==')) padding = 2;
+  else if (cleaned.endsWith('=')) padding = 1;
+  return Math.floor((cleaned.length * 3) / 4) - padding;
+}
+
+/**
+ * Validate outgoing email attachments (from send_email, reply_email, forward_email,
+ * save_draft). Enforces count and size limits and rejects unsafe filenames.
+ * Each attachment must provide exactly one of `content` (base64) or `path`.
+ * @param attachments - The attachments to validate.
+ */
+/**
+ * Resolve and vet a file an attachment points at.
+ *
+ * A path reaches this from a model, so it is not trusted input. Null bytes
+ * truncate the string in the syscall layer and would let a vetted-looking path
+ * open a different file. `realpath` is what the returned path is measured and
+ * read from, so a symlink cannot be checked here and swapped for something else
+ * on the way to the mailer.
+ *
+ * Returns the resolved path and size so the caller counts a file once rather
+ * than stat-ing it again.
+ */
+export async function validateAttachmentPath(
+  filePath: string,
+  maxBytes: number,
+): Promise<{ path: string; size: number }> {
+  if (filePath.includes('\0')) {
+    throw new Error('Attachment path must not contain null bytes');
+  }
+
+  const trimmed = filePath.trim();
+  if (trimmed.length === 0) {
+    throw new Error('Attachment path must not be empty');
+  }
+
+  const resolved = await realpath(resolve(trimmed));
+
+  const stats = await stat(resolved);
+  if (!stats.isFile()) {
+    throw new Error(`Attachment is not a regular file: ${filePath}`);
+  }
+  if (stats.size > maxBytes) {
+    throw new Error(
+      `Attachment ${basename(resolved)} is ${stats.size} bytes, exceeding the ${maxBytes} byte limit`,
+    );
+  }
+
+  return { path: resolved, size: stats.size };
+}
+
+export async function validateAttachments(
+  attachments: AttachmentInput[] | undefined,
+): Promise<void> {
+  if (!attachments || attachments.length === 0) return;
+
+  if (attachments.length > MAX_ATTACHMENTS) {
+    throw new Error(
+      `Too many attachments: max ${MAX_ATTACHMENTS} allowed, got ${attachments.length}`,
+    );
+  }
+
+  let totalSize = 0;
+
+  // Sequential rather than Promise.all: the sizes accumulate into a shared
+  // total, and a rejection here should surface the first offending file rather
+  // than a race between several.
+  // eslint-disable-next-line no-restricted-syntax
+  for (const att of attachments) {
+    const filename = att.filename?.trim();
+    if (!filename) {
+      throw new Error('Each attachment must have a non-empty filename');
+    }
+    /* eslint-disable no-control-regex */
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional — reject control chars and path separators in filenames
+    if (/[\x00-\x1F/\\]/.test(filename)) {
+      throw new Error(
+        `Attachment filename "${filename}" must not contain path separators or control characters`,
+      );
+    }
+    /* eslint-enable no-control-regex */
+
+    const hasContent = typeof att.content === 'string' && att.content.length > 0;
+    const hasPath = typeof att.path === 'string' && att.path.length > 0;
+    if (hasContent === hasPath) {
+      throw new Error(
+        `Attachment "${filename}" must provide exactly one of "content" (base64) or "path"`,
+      );
+    }
+
+    if (hasContent) {
+      const size = base64DecodedSize(att.content as string);
+      if (size > MAX_ATTACHMENT_SIZE) {
+        throw new Error(
+          `Attachment "${filename}" (${Math.round(size / 1024 / 1024)}MB) exceeds the ${MAX_ATTACHMENT_SIZE / 1024 / 1024}MB per-file limit`,
+        );
+      }
+      totalSize += size;
+    } else {
+      // A path was previously accepted unchecked: never resolved, never sized,
+      // and never counted towards the combined limit.
+      // eslint-disable-next-line no-await-in-loop
+      const { size } = await validateAttachmentPath(att.path as string, MAX_ATTACHMENT_SIZE);
+      totalSize += size;
+    }
+  }
+
+  if (totalSize > MAX_TOTAL_ATTACHMENTS_SIZE) {
+    throw new Error(
+      `Total attachment size (${Math.round(totalSize / 1024 / 1024)}MB) exceeds the ${MAX_TOTAL_ATTACHMENTS_SIZE / 1024 / 1024}MB combined limit`,
+    );
   }
 }

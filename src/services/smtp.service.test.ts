@@ -40,6 +40,28 @@ function createMockRateLimiter(allowed = true) {
 function createMockImapService() {
   return {
     appendToSent: vi.fn().mockResolvedValue('INBOX.Sent'),
+    // sendDraft reads the draft and carries its attachments over, so the
+    // fixture needs the shape a real fetchDraft returns.
+    fetchDraft: vi.fn().mockResolvedValue({
+      email: {
+        id: '5',
+        subject: 'Draft subject',
+        to: [{ address: 'dest@example.com' }],
+        bodyText: 'Draft body',
+        attachments: [],
+      },
+      mailbox: 'Drafts',
+    }),
+    deleteDraft: vi.fn().mockResolvedValue(undefined),
+    getEmail: vi.fn().mockResolvedValue({
+      id: '1',
+      subject: 'Original',
+      from: { address: 'sender@example.com' },
+      to: [{ address: 'test@example.com' }],
+      date: new Date().toISOString(),
+      bodyText: 'Original body',
+      attachments: [],
+    }),
   } as unknown as ImapService;
 }
 
@@ -129,6 +151,167 @@ describe('SmtpService', () => {
       expect(call.html).toBe('<h1>Hello</h1>');
       expect(call.text).toBeUndefined();
     });
+
+    it('decodes and sends base64 attachments', async () => {
+      await service.sendEmail('test', {
+        to: ['a@example.com'],
+        subject: 'With attachment',
+        body: 'See attached',
+        attachments: [
+          {
+            filename: 'note.txt',
+            content: Buffer.from('hello').toString('base64'),
+            contentType: 'text/plain',
+          },
+        ],
+      });
+
+      const call = transport.sendMail.mock.calls[0][0];
+      expect(call.attachments).toEqual([
+        { filename: 'note.txt', content: Buffer.from('hello'), contentType: 'text/plain' },
+      ]);
+    });
+
+    it('rejects invalid attachments before sending', async () => {
+      await expect(
+        service.sendEmail('test', {
+          to: ['a@example.com'],
+          subject: 'Bad attachment',
+          body: 'oops',
+          attachments: [{ filename: 'note.txt' }],
+        }),
+      ).rejects.toThrow('exactly one of "content"');
+
+      expect(transport.sendMail).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('forwardEmail', () => {
+    function createMockImapServiceWithEmail(
+      attachments: { filename: string; mimeType: string; size: number }[],
+    ) {
+      return {
+        getEmail: vi.fn().mockResolvedValue({
+          id: '1',
+          subject: 'Original',
+          from: { address: 'sender@example.com' },
+          to: [{ address: 'test@example.com' }],
+          date: new Date().toISOString(),
+          bodyText: 'Original body',
+          attachments,
+        }),
+        downloadAttachment: vi.fn().mockResolvedValue({
+          filename: 'report.pdf',
+          mimeType: 'application/pdf',
+          size: 3,
+          contentBase64: Buffer.from('pdf').toString('base64'),
+        }),
+        // Every send path now files a Sent copy through dispatch().
+        appendToSent: vi.fn().mockResolvedValue('INBOX.Sent'),
+      } as unknown as ImapService;
+    }
+
+    it('does not include original attachments by default', async () => {
+      const mockImap = createMockImapServiceWithEmail([
+        { filename: 'report.pdf', mimeType: 'application/pdf', size: 3 },
+      ]);
+      service = new SmtpService(connections, rateLimiter, mockImap);
+
+      await service.forwardEmail('test', { emailId: '1', to: ['dest@example.com'] });
+
+      const call = transport.sendMail.mock.calls[0][0];
+      expect(call.attachments).toEqual([]);
+      expect(mockImap.downloadAttachment).not.toHaveBeenCalled();
+    });
+
+    it('re-attaches original attachments when includeOriginalAttachments is true', async () => {
+      const mockImap = createMockImapServiceWithEmail([
+        { filename: 'report.pdf', mimeType: 'application/pdf', size: 3 },
+      ]);
+      service = new SmtpService(connections, rateLimiter, mockImap);
+
+      await service.forwardEmail('test', {
+        emailId: '1',
+        to: ['dest@example.com'],
+        includeOriginalAttachments: true,
+      });
+
+      const call = transport.sendMail.mock.calls[0][0];
+      expect(call.attachments).toEqual([
+        { filename: 'report.pdf', content: Buffer.from('pdf'), contentType: 'application/pdf' },
+      ]);
+    });
+
+    it('combines original and user-supplied attachments', async () => {
+      const mockImap = createMockImapServiceWithEmail([
+        { filename: 'report.pdf', mimeType: 'application/pdf', size: 3 },
+      ]);
+      service = new SmtpService(connections, rateLimiter, mockImap);
+
+      await service.forwardEmail('test', {
+        emailId: '1',
+        to: ['dest@example.com'],
+        includeOriginalAttachments: true,
+        attachments: [{ filename: 'note.txt', content: Buffer.from('hi').toString('base64') }],
+      });
+
+      const call = transport.sendMail.mock.calls[0][0];
+      expect(call.attachments).toHaveLength(2);
+      expect(call.attachments[0].filename).toBe('report.pdf');
+      expect(call.attachments[1].filename).toBe('note.txt');
+    });
+  });
+
+  describe('sendDraft', () => {
+    function createMockImapServiceWithDraft(
+      attachments: { filename: string; mimeType: string; size: number }[],
+    ) {
+      return {
+        fetchDraft: vi.fn().mockResolvedValue({
+          email: {
+            id: '5',
+            subject: 'Draft subject',
+            to: [{ address: 'dest@example.com' }],
+            bodyText: 'Draft body',
+            attachments,
+          },
+          mailbox: 'Drafts',
+        }),
+        downloadAttachment: vi.fn().mockResolvedValue({
+          filename: 'invoice.pdf',
+          mimeType: 'application/pdf',
+          size: 3,
+          contentBase64: Buffer.from('pdf').toString('base64'),
+        }),
+        deleteDraft: vi.fn().mockResolvedValue(undefined),
+        appendToSent: vi.fn().mockResolvedValue('INBOX.Sent'),
+      } as unknown as ImapService;
+    }
+
+    it('carries the draft attachments over when sending', async () => {
+      const mockImap = createMockImapServiceWithDraft([
+        { filename: 'invoice.pdf', mimeType: 'application/pdf', size: 3 },
+      ]);
+      service = new SmtpService(connections, rateLimiter, mockImap);
+
+      await service.sendDraft('test', 5);
+
+      const call = transport.sendMail.mock.calls[0][0];
+      expect(call.attachments).toEqual([
+        { filename: 'invoice.pdf', content: Buffer.from('pdf'), contentType: 'application/pdf' },
+      ]);
+      expect(mockImap.deleteDraft).toHaveBeenCalledWith('test', 5, 'Drafts');
+    });
+
+    it('sends with no attachments when the draft has none', async () => {
+      const mockImap = createMockImapServiceWithDraft([]);
+      service = new SmtpService(connections, rateLimiter, mockImap);
+
+      await service.sendDraft('test', 5);
+
+      const call = transport.sendMail.mock.calls[0][0];
+      expect(call.attachments).toEqual([]);
+    });
   });
 
   // -----------------------------------------------------------------------
@@ -210,12 +393,14 @@ describe('SmtpService', () => {
         messageId: '<orig@example.com>',
         date: '2026-01-01',
         bodyText: 'body',
+        attachments: [],
       });
       imap.fetchDraft = vi.fn().mockResolvedValue({
         email: {
           to: [{ address: 'recipient@example.com' }],
           subject: 'Draft',
           bodyText: 'draft body',
+          attachments: [],
         },
         mailbox: 'INBOX.Drafts',
       });
@@ -237,7 +422,12 @@ describe('SmtpService', () => {
         deleteDraft: ReturnType<typeof vi.fn>;
       };
       imap.fetchDraft = vi.fn().mockResolvedValue({
-        email: { to: [{ address: 'recipient@example.com' }], subject: 'D', bodyText: 'b' },
+        email: {
+          to: [{ address: 'recipient@example.com' }],
+          subject: 'D',
+          bodyText: 'b',
+          attachments: [],
+        },
         mailbox: 'INBOX.Drafts',
       });
       imap.deleteDraft = vi.fn().mockResolvedValue(undefined);

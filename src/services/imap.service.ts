@@ -6,9 +6,14 @@
 
 import type { ImapFlow } from 'imapflow';
 import type { IConnectionManager } from '../connections/types.js';
-import { sanitizeMailboxName, sanitizeSearchQuery } from '../safety/validation.js';
+import {
+  sanitizeMailboxName,
+  sanitizeSearchQuery,
+  validateAttachments,
+} from '../safety/validation.js';
 import type {
   AccountConfig,
+  AttachmentInput,
   AttachmentMeta,
   BulkResult,
   Contact,
@@ -26,6 +31,7 @@ import type {
 } from '../types/index.js';
 import { buildPreview, findPreviewPart, PREVIEW_PART_BYTES } from '../utils/body-preview.js';
 import { BULK_HEADER_FIELDS, classifyBulk, parseHeaderBlock } from '../utils/bulk-headers.js';
+import { buildRawMessage, resolveAttachments } from '../utils/mail-attachments.js';
 import type { LabelStrategy } from './label-strategy.js';
 import { detectLabelStrategy } from './label-strategy.js';
 
@@ -1173,8 +1179,11 @@ export default class ImapService {
       bcc?: string[];
       html?: boolean;
       inReplyTo?: string;
+      attachments?: AttachmentInput[];
     },
   ): Promise<{ id: number; mailbox: string }> {
+    await validateAttachments(options.attachments);
+
     const client = await this.connections.getImapClient(accountName);
     const account = this.connections.getAccount(accountName);
 
@@ -1183,28 +1192,42 @@ export default class ImapService {
     const drafts = mailboxes.find((mb) => mb.specialUse === '\\Drafts');
     const draftsPath = drafts?.path ?? 'Drafts';
 
-    // Construct RFC 822 message
-    const headers = [
-      `From: ${account.fullName ? `"${account.fullName}" <${account.email}>` : account.email}`,
-      `To: ${options.to.join(', ')}`,
-      `Subject: ${options.subject}`,
-      `Date: ${new Date().toUTCString()}`,
-      `MIME-Version: 1.0`,
-    ];
+    let rawMessage: Buffer;
 
-    if (options.cc?.length) headers.push(`Cc: ${options.cc.join(', ')}`);
-    if (options.bcc?.length) headers.push(`Bcc: ${options.bcc.join(', ')}`);
-    if (options.inReplyTo) headers.push(`In-Reply-To: ${options.inReplyTo}`);
+    if (options.attachments?.length) {
+      // Build a proper MIME message so attachments survive as separate parts.
+      const attachments = await resolveAttachments(options.attachments);
+      rawMessage = await buildRawMessage({
+        from: account.fullName ? `"${account.fullName}" <${account.email}>` : account.email,
+        to: options.to.join(', '),
+        cc: options.cc?.join(', '),
+        bcc: options.bcc?.join(', '),
+        subject: options.subject,
+        inReplyTo: options.inReplyTo,
+        attachments,
+        ...(options.html ? { html: options.body } : { text: options.body }),
+      });
+    } else {
+      // Construct RFC 822 message
+      const headers = [
+        `From: ${account.fullName ? `"${account.fullName}" <${account.email}>` : account.email}`,
+        `To: ${options.to.join(', ')}`,
+        `Subject: ${options.subject}`,
+        `Date: ${new Date().toUTCString()}`,
+        `MIME-Version: 1.0`,
+      ];
 
-    const contentType = options.html ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8';
-    headers.push(`Content-Type: ${contentType}`);
+      if (options.cc?.length) headers.push(`Cc: ${options.cc.join(', ')}`);
+      if (options.bcc?.length) headers.push(`Bcc: ${options.bcc.join(', ')}`);
+      if (options.inReplyTo) headers.push(`In-Reply-To: ${options.inReplyTo}`);
 
-    const rawMessage = `${headers.join('\r\n')}\r\n\r\n${options.body}`;
+      const contentType = options.html ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8';
+      headers.push(`Content-Type: ${contentType}`);
 
-    const appendResult = await client.append(draftsPath, Buffer.from(rawMessage), [
-      '\\Draft',
-      '\\Seen',
-    ]);
+      rawMessage = Buffer.from(`${headers.join('\r\n')}\r\n\r\n${options.body}`);
+    }
+
+    const appendResult = await client.append(draftsPath, rawMessage, ['\\Draft', '\\Seen']);
 
     return {
       id: (appendResult as unknown as { uid?: number }).uid ?? 0,

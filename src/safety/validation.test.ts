@@ -1,7 +1,13 @@
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import {
+  MAX_ATTACHMENT_SIZE,
   sanitizeMailboxName,
   sanitizeSearchQuery,
   sanitizeTemplateVariable,
+  validateAttachments,
   validateInputLength,
   validateLabelName,
   validateWebhookUrl,
@@ -155,6 +161,111 @@ describe('validateLabelName', () => {
 
   it('trims whitespace and returns valid name', () => {
     expect(validateLabelName('  Important  ')).toBe('Important');
+  });
+});
+
+describe('validateAttachments', () => {
+  let dir: string;
+  let file: string;
+
+  beforeAll(async () => {
+    // realpath: on macOS the temp dir sits under /var, itself a symlink to
+    // /private/var, and validateAttachmentPath returns resolved paths.
+    dir = await realpath(await mkdtemp(join(tmpdir(), 'email-mcp-attach-')));
+    file = join(dir, 'a.txt');
+    await writeFile(file, 'hello');
+  });
+
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('allows undefined and empty arrays', async () => {
+    await expect(validateAttachments(undefined)).resolves.toBeUndefined();
+    await expect(validateAttachments([])).resolves.toBeUndefined();
+  });
+
+  it('allows a valid base64 attachment', async () => {
+    await expect(
+      validateAttachments([
+        { filename: 'a.txt', content: Buffer.from('hello').toString('base64') },
+      ]),
+    ).resolves.toBeUndefined();
+  });
+
+  it('allows a path-based attachment that exists', async () => {
+    await expect(validateAttachments([{ filename: 'a.txt', path: file }])).resolves.toBeUndefined();
+  });
+
+  // Each of these used to pass unchecked: a path was never resolved, never
+  // sized, and never counted towards the combined limit.
+  it('rejects a path that does not exist', async () => {
+    await expect(
+      validateAttachments([{ filename: 'a.txt', path: join(dir, 'missing.txt') }]),
+    ).rejects.toThrow();
+  });
+
+  it('rejects a path containing a null byte', async () => {
+    await expect(
+      validateAttachments([{ filename: 'a.txt', path: `${file}\0.png` }]),
+    ).rejects.toThrow('null bytes');
+  });
+
+  it('rejects a path that is not a regular file', async () => {
+    await expect(validateAttachments([{ filename: 'a.txt', path: dir }])).rejects.toThrow(
+      'not a regular file',
+    );
+  });
+
+  it('counts a path-based attachment towards the combined limit', async () => {
+    const big = join(dir, 'big.bin');
+    await writeFile(big, Buffer.alloc(MAX_ATTACHMENT_SIZE + 1));
+
+    await expect(validateAttachments([{ filename: 'big.bin', path: big }])).rejects.toThrow(
+      'exceeding',
+    );
+
+    await rm(big, { force: true });
+  });
+
+  it('throws when more than the max number of attachments are given', async () => {
+    const attachments = Array.from({ length: 11 }, (_, i) => ({
+      filename: `f${i}.txt`,
+      content: 'aGVsbG8=',
+    }));
+    await expect(validateAttachments(attachments)).rejects.toThrow('Too many attachments');
+  });
+
+  it('throws on empty filename', async () => {
+    await expect(validateAttachments([{ filename: '', content: 'aGVsbG8=' }])).rejects.toThrow(
+      'non-empty filename',
+    );
+  });
+
+  it('throws on filename with a path separator', async () => {
+    await expect(
+      validateAttachments([{ filename: '../evil.txt', content: 'aGVsbG8=' }]),
+    ).rejects.toThrow('path separators');
+  });
+
+  it('throws when neither content nor path is provided', async () => {
+    await expect(validateAttachments([{ filename: 'a.txt' }])).rejects.toThrow(
+      'exactly one of "content"',
+    );
+  });
+
+  it('throws when both content and path are provided', async () => {
+    await expect(
+      validateAttachments([{ filename: 'a.txt', content: 'aGVsbG8=', path: file }]),
+    ).rejects.toThrow('exactly one of "content"');
+  });
+
+  it('throws when a single attachment exceeds the per-file limit', async () => {
+    const oversized = 'A'.repeat(Math.ceil(((MAX_ATTACHMENT_SIZE + 1024) * 4) / 3));
+
+    await expect(
+      validateAttachments([{ filename: 'big.bin', content: oversized }]),
+    ).rejects.toThrow('per-file limit');
   });
 });
 
