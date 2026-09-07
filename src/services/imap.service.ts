@@ -8,6 +8,7 @@ import type { ImapFlow } from 'imapflow';
 import type { IConnectionManager } from '../connections/types.js';
 import { sanitizeMailboxName, sanitizeSearchQuery } from '../safety/validation.js';
 import type {
+  AccountConfig,
   AttachmentMeta,
   BulkResult,
   Contact,
@@ -64,6 +65,23 @@ function dkimSigningDomains(authenticationResults: string, dkimSignature: string
   const fromSignature = [...dkimSignature.matchAll(/(?:^|;)\s*d\s*=\s*([^;\s]+)/gi)];
 
   return [...new Set([...fromResults, ...fromSignature].map((match) => clean(match[1])))];
+}
+
+/**
+ * Whether this account should APPEND its own copy of outgoing mail.
+ *
+ * Gmail files messages sent through its SMTP into Sent Mail itself, so an
+ * APPEND on top of that leaves the user with every sent message twice. Its
+ * IMAP server is identifiable by the X-GM-EXT-1 capability, which is a more
+ * reliable signal than matching on the hostname.
+ *
+ * `save_to_sent` overrides the guess in either direction.
+ */
+function shouldFileSentCopy(account: AccountConfig, client: ImapFlow): boolean {
+  if (account.saveToSent !== undefined) {
+    return account.saveToSent;
+  }
+  return !client.capabilities.has('X-GM-EXT-1');
 }
 
 function hasAttachments(bodyStructure: unknown): boolean {
@@ -1218,6 +1236,36 @@ export default class ImapService {
 
     const email = await this.getEmail(accountName, String(emailId), draftsPath);
     return { email, mailbox: draftsPath };
+  }
+
+  /**
+   * File a copy of an outgoing message in the account's Sent folder.
+   *
+   * SMTP only hands the message to the next hop; nothing about sending puts a
+   * copy in the mailbox. Mail clients APPEND it themselves, so a server-side
+   * sender that skips this leaves no record of what it sent.
+   */
+  async appendToSent(accountName: string, raw: Buffer): Promise<string | null> {
+    const client = await this.connections.getImapClient(accountName);
+    const account = this.connections.getAccount(accountName);
+
+    if (!shouldFileSentCopy(account, client)) {
+      return null;
+    }
+
+    // A server that does not advertise SPECIAL-USE makes the client guess the
+    // Sent folder from its name, and the guess loses on a mailbox that carries
+    // several sent-shaped folders left by different clients over the years — it
+    // can land on an empty one nobody reads. `sent_mailbox` settles it.
+    let sentPath = account.sentMailbox;
+    if (!sentPath) {
+      const mailboxes = await client.list();
+      sentPath = mailboxes.find((mb) => mb.specialUse === '\\Sent')?.path ?? 'Sent';
+    }
+
+    await client.append(sentPath, raw, ['\\Seen']);
+
+    return sentPath;
   }
 
   /** Delete a draft after it has been sent. */

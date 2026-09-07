@@ -52,6 +52,8 @@ export const AccountConfigSchema = z
     /** Shell command whose trimmed stdout is used as the password. */
     password_command: z.string().min(1, 'password_command cannot be empty').optional(),
     oauth2: OAuth2ConfigSchema.optional(),
+    sent_mailbox: z.string().optional(),
+    save_to_sent: z.boolean().optional(),
     imap: ImapConfigSchema,
     smtp: SmtpConfigSchema,
   })
