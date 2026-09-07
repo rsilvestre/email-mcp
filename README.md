@@ -676,7 +676,7 @@ Features:
 
 ## API
 
-### Tools (47)
+### Tools (49)
 
 #### Read (15)
 
@@ -788,7 +788,7 @@ markup residue.
 | `check_notification_setup` | Diagnose desktop notification support and provide setup instructions |
 | `test_notification` | Send a test notification to verify OS permissions are configured |
 
-#### Calendar & Reminders (6)
+#### Calendar & Reminders (8)
 
 | Tool | Description |
 |------|-------------|
@@ -798,6 +798,8 @@ markup residue.
 | `create_reminder` | Create a reminder in macOS Reminders.app from an email |
 | `list_calendars` | List all available local calendars |
 | `check_calendar_permissions` | Check whether the local calendar is accessible |
+| `list_events` | List local calendar events in a time range, optionally filtered by title or calendar |
+| `list_reminders` | List local reminders, optionally filtered by title or list name |
 
 ### Prompts (7)
 
