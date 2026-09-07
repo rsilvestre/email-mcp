@@ -1023,7 +1023,7 @@ export default class ImapService {
       attachments?: AttachmentInput[];
     },
   ): Promise<{ id: number; mailbox: string }> {
-    validateAttachments(options.attachments);
+    await validateAttachments(options.attachments);
 
     const client = await this.connections.getImapClient(accountName);
     const account = this.connections.getAccount(accountName);

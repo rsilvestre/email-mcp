@@ -1,5 +1,8 @@
 /** Input validation and sanitization utilities. */
 
+import { realpath, stat } from 'node:fs/promises';
+import { basename, resolve } from 'node:path';
+
 import type { AttachmentInput } from '../types/index.js';
 
 /** Maximum number of attachments allowed on a single outgoing email. */
@@ -144,7 +147,49 @@ function base64DecodedSize(base64: string): number {
  * Each attachment must provide exactly one of `content` (base64) or `path`.
  * @param attachments - The attachments to validate.
  */
-export function validateAttachments(attachments: AttachmentInput[] | undefined): void {
+/**
+ * Resolve and vet a file an attachment points at.
+ *
+ * A path reaches this from a model, so it is not trusted input. Null bytes
+ * truncate the string in the syscall layer and would let a vetted-looking path
+ * open a different file. `realpath` is what the returned path is measured and
+ * read from, so a symlink cannot be checked here and swapped for something else
+ * on the way to the mailer.
+ *
+ * Returns the resolved path and size so the caller counts a file once rather
+ * than stat-ing it again.
+ */
+export async function validateAttachmentPath(
+  filePath: string,
+  maxBytes: number,
+): Promise<{ path: string; size: number }> {
+  if (filePath.includes('\0')) {
+    throw new Error('Attachment path must not contain null bytes');
+  }
+
+  const trimmed = filePath.trim();
+  if (trimmed.length === 0) {
+    throw new Error('Attachment path must not be empty');
+  }
+
+  const resolved = await realpath(resolve(trimmed));
+
+  const stats = await stat(resolved);
+  if (!stats.isFile()) {
+    throw new Error(`Attachment is not a regular file: ${filePath}`);
+  }
+  if (stats.size > maxBytes) {
+    throw new Error(
+      `Attachment ${basename(resolved)} is ${stats.size} bytes, exceeding the ${maxBytes} byte limit`,
+    );
+  }
+
+  return { path: resolved, size: stats.size };
+}
+
+export async function validateAttachments(
+  attachments: AttachmentInput[] | undefined,
+): Promise<void> {
   if (!attachments || attachments.length === 0) return;
 
   if (attachments.length > MAX_ATTACHMENTS) {
@@ -155,7 +200,11 @@ export function validateAttachments(attachments: AttachmentInput[] | undefined):
 
   let totalSize = 0;
 
-  attachments.forEach((att) => {
+  // Sequential rather than Promise.all: the sizes accumulate into a shared
+  // total, and a rejection here should surface the first offending file rather
+  // than a race between several.
+  // eslint-disable-next-line no-restricted-syntax
+  for (const att of attachments) {
     const filename = att.filename?.trim();
     if (!filename) {
       throw new Error('Each attachment must have a non-empty filename');
@@ -185,8 +234,14 @@ export function validateAttachments(attachments: AttachmentInput[] | undefined):
         );
       }
       totalSize += size;
+    } else {
+      // A path was previously accepted unchecked: never resolved, never sized,
+      // and never counted towards the combined limit.
+      // eslint-disable-next-line no-await-in-loop
+      const { size } = await validateAttachmentPath(att.path as string, MAX_ATTACHMENT_SIZE);
+      totalSize += size;
     }
-  });
+  }
 
   if (totalSize > MAX_TOTAL_ATTACHMENTS_SIZE) {
     throw new Error(

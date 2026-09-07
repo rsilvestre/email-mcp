@@ -35,7 +35,7 @@ export default class SmtpService {
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
-    validateAttachments(options.attachments);
+    await validateAttachments(options.attachments);
 
     const account = this.connections.getAccount(accountName);
     const transport = await this.connections.getSmtpTransport(accountName);
@@ -73,7 +73,7 @@ export default class SmtpService {
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
-    validateAttachments(options.attachments);
+    await validateAttachments(options.attachments);
 
     const account = this.connections.getAccount(accountName);
     const original = await this.imapService.getEmail(accountName, options.emailId, options.mailbox);
@@ -141,7 +141,7 @@ export default class SmtpService {
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
-    validateAttachments(options.attachments);
+    await validateAttachments(options.attachments);
 
     const account = this.connections.getAccount(accountName);
     const mailbox = options.mailbox ?? 'INBOX';
