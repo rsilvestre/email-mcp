@@ -59,6 +59,25 @@ export default class ConnectionManager implements IConnectionManager {
   // IMAP
   // -------------------------------------------------------------------------
 
+  private registerImapLifecycle(accountName: string, client: ImapFlow): void {
+    const invalidateIfCurrent = () => {
+      if (this.imapClients.get(accountName) === client) {
+        this.imapClients.delete(accountName);
+      }
+    };
+
+    client.on('error', (err) => {
+      invalidateIfCurrent();
+      mcpLog(
+        'error',
+        'imap',
+        `Connection error for "${accountName}": ${err instanceof Error ? err.message : String(err)}`,
+      ).catch(() => undefined);
+    });
+
+    client.on('close', invalidateIfCurrent);
+  }
+
   async getImapClient(accountName: string): Promise<ImapFlow> {
     const existing = this.imapClients.get(accountName);
     if (existing?.usable) {
@@ -90,6 +109,7 @@ export default class ConnectionManager implements IConnectionManager {
       logger: false,
     });
 
+    this.registerImapLifecycle(accountName, client);
     await client.connect();
     await mcpLog(
       'info',
@@ -218,6 +238,7 @@ export default class ConnectionManager implements IConnectionManager {
         auth,
         logger: false,
       });
+      client.on('error', () => {});
       await client.connect();
 
       const mailboxes = await client.list();
