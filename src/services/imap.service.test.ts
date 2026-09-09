@@ -1035,3 +1035,77 @@ describe('ImapService.listMailboxes', () => {
     expect(mailboxes[0]).toMatchObject({ totalMessages: 0, unseenMessages: 0 });
   });
 });
+
+// ---------------------------------------------------------------------------
+// getThread with server-side threading
+// ---------------------------------------------------------------------------
+
+describe('ImapService.getThread with server-side threading', () => {
+  let client: ReturnType<typeof createMockImapClient>;
+  let service: ImapService;
+  let searchCriteria: Record<string, unknown>[];
+
+  beforeEach(() => {
+    client = createMockImapClient();
+    service = new ImapService(createMockConnectionManager(client));
+    searchCriteria = [];
+    client.search.mockImplementation(async (criteria: Record<string, unknown>) => {
+      searchCriteria.push(criteria);
+      return [1, 2, 3];
+    });
+    client.fetch.mockImplementation(() => {
+      async function* messages() {
+        yield {
+          uid: 1,
+          envelope: { messageId: '<root@x>', date: '2026-01-01', from: [], to: [] },
+          flags: new Set<string>(),
+          bodyStructure: { type: 'text/plain' },
+          headers: Buffer.from('Subject: fil\r\n'),
+        };
+      }
+      return messages();
+    });
+    client.download.mockResolvedValue(undefined);
+  });
+
+  it('asks for the thread id alongside the root headers', async () => {
+    client.fetchOne.mockResolvedValue({ uid: 1, envelope: {}, threadId: 'thr-42' });
+
+    await service.getThread('test', '<root@x>', 'INBOX');
+
+    // It rides along on a fetch that was happening anyway.
+    const rootOptions = client.fetchOne.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(rootOptions.threadId).toBe(true);
+  });
+
+  it('resolves the thread with a single search when the server threads', async () => {
+    client.fetchOne.mockResolvedValue({ uid: 1, envelope: {}, threadId: 'thr-42' });
+
+    await service.getThread('test', '<root@x>', 'INBOX');
+
+    // Root lookup, then one search by thread id — not three header searches.
+    expect(searchCriteria).toHaveLength(2);
+    expect(searchCriteria[1]).toEqual({ threadId: 'thr-42' });
+  });
+
+  it('follows the References chain when the server offers no thread id', async () => {
+    client.fetchOne.mockResolvedValue({
+      uid: 1,
+      envelope: { inReplyTo: '<parent@x>' },
+      headers: Buffer.from('References: <a@x>\r\n'),
+    });
+
+    await service.getThread('test', '<root@x>', 'INBOX');
+
+    expect(searchCriteria).toHaveLength(4);
+    expect(searchCriteria[1]).not.toHaveProperty('threadId');
+  });
+
+  it('ignores an empty thread id rather than searching for nothing', async () => {
+    client.fetchOne.mockResolvedValue({ uid: 1, envelope: {}, threadId: '' });
+
+    await service.getThread('test', '<root@x>', 'INBOX');
+
+    expect(searchCriteria).toHaveLength(4);
+  });
+});

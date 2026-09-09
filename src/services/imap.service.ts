@@ -1736,6 +1736,11 @@ export default class ImapService {
       // Collect all Message-IDs in the thread
       const targetMsgIds = new Set<string>([messageId]);
 
+      // Set when the server threads messages itself: Gmail's X-GM-THRID, or
+      // THREADID from OBJECTID. Following References is the fallback for
+      // servers that do not.
+      let serverThreadId: string | undefined;
+
       // First, find the root message to get its References chain
       const rootSearch = await client.search(
         { header: { 'Message-ID': messageId } },
@@ -1747,12 +1752,17 @@ export default class ImapService {
         const rootMsg = await client.fetchOne(
           String(rootUids[0]),
           // Only the References header is read below, so do not pull the body.
-          { uid: true, envelope: true, headers: true },
+          // threadId rides along at no extra cost and, where the server keeps
+          // its own threading, replaces the header chasing entirely.
+          { uid: true, envelope: true, headers: true, threadId: true },
           { uid: true },
         );
 
         if (rootMsg) {
           const raw = rootMsg as unknown as Record<string, unknown>;
+          if (typeof raw.threadId === 'string' && raw.threadId) {
+            serverThreadId = raw.threadId;
+          }
           const envelope = (raw.envelope ?? {}) as Record<string, unknown>;
           const inReplyTo = envelope.inReplyTo as string | undefined;
           if (inReplyTo) targetMsgIds.add(inReplyTo);
@@ -1772,16 +1782,28 @@ export default class ImapService {
         }
       }
 
-      // Find the messages of the thread: those carrying one of the collected
-      // Message-IDs, and those replying to one. Three OR'd searches rather than
-      // three per Message-ID.
-      const wantedIds = Array.from(targetMsgIds);
-      const matchedUidGroups = await Promise.all([
-        ImapService.searchHeaderAnyOf(client, 'Message-ID', wantedIds),
-        ImapService.searchHeaderAnyOf(client, 'References', wantedIds),
-        ImapService.searchHeaderAnyOf(client, 'In-Reply-To', wantedIds),
-      ]);
-      const foundUids = new Set<number>(matchedUidGroups.flat());
+      // Find the messages of the thread.
+      //
+      // Where the server threads for us, one search by thread id settles it,
+      // and it is also more accurate: a reply whose References chain was
+      // mangled in transit still carries the right thread id.
+      //
+      // Otherwise, follow the chain: those carrying one of the collected
+      // Message-IDs, and those replying to one — three OR'd searches rather
+      // than three per Message-ID.
+      let foundUids: Set<number>;
+      if (serverThreadId) {
+        const threaded = await client.search({ threadId: serverThreadId }, { uid: true });
+        foundUids = new Set<number>(Array.isArray(threaded) ? threaded : []);
+      } else {
+        const wantedIds = Array.from(targetMsgIds);
+        const matchedUidGroups = await Promise.all([
+          ImapService.searchHeaderAnyOf(client, 'Message-ID', wantedIds),
+          ImapService.searchHeaderAnyOf(client, 'References', wantedIds),
+          ImapService.searchHeaderAnyOf(client, 'In-Reply-To', wantedIds),
+        ]);
+        foundUids = new Set<number>(matchedUidGroups.flat());
+      }
 
       if (foundUids.size === 0) {
         return {
