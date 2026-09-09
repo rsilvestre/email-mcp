@@ -1013,7 +1013,7 @@ describe('ImapService.listMailboxes', () => {
   });
 
   // Without the extension the counts are what make this call expensive: one
-  // round trip per folder, measured at 6 seconds on a 309-folder account.
+  // round trip per folder, on an account that may hold hundreds.
   it('omits the counts without the extension rather than paying for them', async () => {
     client.capabilities = new Set<string>();
     client.list.mockResolvedValue([

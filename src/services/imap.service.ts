@@ -499,10 +499,13 @@ export default class ImapService {
    * List an account's folders, with message counts where they are affordable.
    *
    * A server offering LIST-STATUS returns the counters inline with the listing,
-   * so they cost nothing and are always included. Without it each folder needs
-   * its own STATUS round trip — measured at 6 seconds on a 309-folder account,
-   * to display numbers a caller looking for a folder name rarely reads. There
-   * they are omitted unless asked for.
+   * so they cost nothing and are always included. Without that extension each
+   * folder needs its own STATUS round trip, to display numbers a caller looking
+   * for a folder name rarely reads, so there they are omitted unless asked for.
+   *
+   * No account measured here lacks the extension, so the saving is reasoned
+   * from the round trip count rather than observed. An earlier version of this
+   * comment cited a six-second measurement that did not replicate.
    */
   async listMailboxes(
     accountName: string,

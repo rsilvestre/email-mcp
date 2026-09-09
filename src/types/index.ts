@@ -185,9 +185,9 @@ export interface Mailbox {
    * Message counts, absent when they were not asked for.
    *
    * A server offering LIST-STATUS returns them with the folder list at no
-   * extra cost. Without it they mean one STATUS round trip per folder —
-   * measured at 6 seconds on a 309-folder account — so they are omitted unless
-   * the caller wants them.
+   * extra cost, and they are always present there. Without that extension they
+   * mean one STATUS round trip per folder, so on an account with hundreds of
+   * folders they are omitted unless the caller wants them.
    */
   totalMessages?: number;
   unseenMessages?: number;

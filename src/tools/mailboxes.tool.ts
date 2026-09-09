@@ -17,7 +17,7 @@ export default function registerMailboxesTools(server: McpServer, imapService: I
         .boolean()
         .optional()
         .describe(
-          'Include message and unread counts. Free where the server supports LIST-STATUS and always included there. Elsewhere each folder costs a separate round trip — 6 seconds on a 309-folder account — so it is off unless requested.',
+          'Include message and unread counts. Free where the server supports LIST-STATUS, and always included there. Without that extension each folder needs its own STATUS round trip, so on an account with hundreds of folders the counts dominate the call and are off unless requested.',
         ),
     },
     { readOnlyHint: true, destructiveHint: false },
