@@ -7,14 +7,22 @@ interface MockClient {
   connect: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
   logout: ReturnType<typeof vi.fn>;
+  noop: ReturnType<typeof vi.fn>;
   on: (event: string, listener: MockListener) => MockClient;
   emit: (event: string, ...args: unknown[]) => boolean;
 }
 
 const imapInstances = vi.hoisted(() => [] as MockClient[]);
 
-/** Lets a test make the next N connect() attempts fail. */
-const imapControl = vi.hoisted(() => ({ failNextConnectCount: 0 }));
+/**
+ * Lets a test steer the mock connection: fail the next N connect() attempts, or
+ * decide how a liveness probe behaves ('ok', 'reject', or 'hang' for a socket
+ * that has been dropped without anyone noticing).
+ */
+const imapControl = vi.hoisted(() => ({
+  failNextConnectCount: 0,
+  probeBehaviour: 'ok' as 'ok' | 'reject' | 'hang',
+}));
 
 vi.mock('imapflow', () => {
   class MockImapFlow {
@@ -28,6 +36,11 @@ vi.mock('imapflow', () => {
     });
     close = vi.fn();
     logout = vi.fn().mockResolvedValue(undefined);
+    noop = vi.fn().mockImplementation(async () => {
+      if (imapControl.probeBehaviour === 'reject') throw new Error('Connection closed');
+      if (imapControl.probeBehaviour === 'hang') return new Promise(() => {});
+      return undefined;
+    });
     private listeners = new Map<string, MockListener[]>();
 
     constructor(_options: unknown) {
@@ -145,6 +158,97 @@ describe('ConnectionManager concurrent IMAP connection setup', () => {
     );
 
     expect(outcomes.every((outcome) => outcome.status === 'rejected')).toBe(true);
+    expect(imapInstances).toHaveLength(1);
+  });
+});
+
+describe('ConnectionManager stale IMAP connection detection', () => {
+  // The manager probes a pooled connection that has been idle past its
+  // threshold. Fake timers let a test age a connection without waiting, and
+  // let the probe's own timeout fire on demand.
+  const IDLE_THRESHOLD_MS = 60_000;
+  const PROBE_TIMEOUT_MS = 5_000;
+
+  beforeEach(() => {
+    imapInstances.length = 0;
+    imapControl.failNextConnectCount = 0;
+    imapControl.probeBehaviour = 'ok';
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('reuses a recently used connection without probing it', async () => {
+    const manager = new ConnectionManager([account]);
+    const first = (await manager.getImapClient('test')) as unknown as MockClient;
+
+    const second = (await manager.getImapClient('test')) as unknown as MockClient;
+
+    // Probing on every call would spend a round trip to save none.
+    expect(first.noop).not.toHaveBeenCalled();
+    expect(second).toBe(first);
+    expect(imapInstances).toHaveLength(1);
+  });
+
+  it('probes an idle connection and reuses it when it answers', async () => {
+    const manager = new ConnectionManager([account]);
+    const first = (await manager.getImapClient('test')) as unknown as MockClient;
+
+    await vi.advanceTimersByTimeAsync(IDLE_THRESHOLD_MS + 1_000);
+    const second = (await manager.getImapClient('test')) as unknown as MockClient;
+
+    expect(first.noop).toHaveBeenCalledTimes(1);
+    expect(second).toBe(first);
+    // A live connection must survive the probe: rebuilding here would throw
+    // away the pooling this whole class exists for.
+    expect(imapInstances).toHaveLength(1);
+  });
+
+  it('rebuilds when an idle connection rejects the probe', async () => {
+    const manager = new ConnectionManager([account]);
+    const first = (await manager.getImapClient('test')) as unknown as MockClient;
+
+    imapControl.probeBehaviour = 'reject';
+    await vi.advanceTimersByTimeAsync(IDLE_THRESHOLD_MS + 1_000);
+    const second = (await manager.getImapClient('test')) as unknown as MockClient;
+
+    expect(second).not.toBe(first);
+    expect(imapInstances).toHaveLength(2);
+  });
+
+  it('rebuilds when an idle connection never answers the probe', async () => {
+    const manager = new ConnectionManager([account]);
+    const first = (await manager.getImapClient('test')) as unknown as MockClient;
+
+    // The case that actually bites: the socket was dropped silently, so the
+    // command is never answered and never rejected. Without the probe timeout
+    // this call would hang exactly as the tool call used to.
+    imapControl.probeBehaviour = 'hang';
+    await vi.advanceTimersByTimeAsync(IDLE_THRESHOLD_MS + 1_000);
+
+    const pending = manager.getImapClient('test');
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS + 100);
+    const second = (await pending) as unknown as MockClient;
+
+    expect(second).not.toBe(first);
+    expect(imapInstances).toHaveLength(2);
+  });
+
+  it('probes once when callers race on an idle connection', async () => {
+    const manager = new ConnectionManager([account]);
+    const first = (await manager.getImapClient('test')) as unknown as MockClient;
+
+    await vi.advanceTimersByTimeAsync(IDLE_THRESHOLD_MS + 1_000);
+    const clients = await Promise.all(
+      Array.from({ length: 5 }, async () => manager.getImapClient('test')),
+    );
+
+    // The probe belongs inside the in-flight guard, or five callers send five
+    // NOOPs to answer the same question.
+    expect(first.noop).toHaveBeenCalledTimes(1);
+    expect(new Set(clients).size).toBe(1);
     expect(imapInstances).toHaveLength(1);
   });
 });

@@ -21,11 +21,30 @@ type SmtpAuth =
   | { user: string; pass?: string }
   | { type: string; user: string; accessToken: string };
 
+/**
+ * How long a pooled IMAP connection may sit unused before it is probed.
+ *
+ * `ImapFlow.usable` only goes false once the socket reports an error or close.
+ * A connection dropped silently — Gmail reaping an idle session, a NAT or
+ * firewall expiring the mapping without an RST — stays `usable`, so the next
+ * tool call issues its command into a dead socket and blocks until something
+ * times out. The failure then fires 'close', the entry is invalidated, and the
+ * user's retry succeeds instantly: the intermittent stall that reads as "the
+ * server is slow".
+ */
+const IDLE_BEFORE_PROBE_MS = Number(process.env.MCP_EMAIL_IMAP_IDLE_PROBE_MS ?? 60_000);
+
+/** How long the liveness probe itself may take before the connection is rebuilt. */
+const PROBE_TIMEOUT_MS = Number(process.env.MCP_EMAIL_IMAP_PROBE_TIMEOUT_MS ?? 5_000);
+
 export default class ConnectionManager implements IConnectionManager {
   private imapClients = new Map<string, ImapFlow>();
 
   /** Connections currently being opened, so concurrent callers join one attempt. */
   private imapClientsConnecting = new Map<string, Promise<ImapFlow>>();
+
+  /** When each pooled IMAP connection was last handed out, for idle probing. */
+  private imapClientsLastUsedAt = new Map<string, number>();
 
   private smtpTransports = new Map<string, Transporter>();
 
@@ -66,6 +85,7 @@ export default class ConnectionManager implements IConnectionManager {
     const invalidateIfCurrent = () => {
       if (this.imapClients.get(accountName) === client) {
         this.imapClients.delete(accountName);
+        this.imapClientsLastUsedAt.delete(accountName);
       }
     };
 
@@ -81,9 +101,43 @@ export default class ConnectionManager implements IConnectionManager {
     client.on('close', invalidateIfCurrent);
   }
 
+  /**
+   * Has this connection been idle long enough that it might have been dropped
+   * without us hearing about it?
+   */
+  private hasBeenIdleTooLong(accountName: string): boolean {
+    if (IDLE_BEFORE_PROBE_MS <= 0) return false;
+    const lastUsedAt = this.imapClientsLastUsedAt.get(accountName);
+    return lastUsedAt === undefined || Date.now() - lastUsedAt > IDLE_BEFORE_PROBE_MS;
+  }
+
+  /**
+   * Confirm a connection still answers, within a bounded time.
+   *
+   * NOOP is the cheapest command that proves the round trip works. The race is
+   * what makes this worth doing: a dead socket typically does not reject, it
+   * simply never answers, so waiting on the NOOP alone would reproduce the very
+   * stall this is meant to avoid.
+   */
+  private static async respondsToProbe(client: ImapFlow): Promise<boolean> {
+    let probeTimer: NodeJS.Timeout | undefined;
+    try {
+      const timedOut = new Promise<false>((resolve) => {
+        probeTimer = setTimeout(() => resolve(false), PROBE_TIMEOUT_MS);
+        probeTimer.unref?.();
+      });
+      return await Promise.race([client.noop().then(() => true), timedOut]);
+    } catch {
+      return false;
+    } finally {
+      if (probeTimer) clearTimeout(probeTimer);
+    }
+  }
+
   async getImapClient(accountName: string): Promise<ImapFlow> {
     const existing = this.imapClients.get(accountName);
-    if (existing?.usable) {
+    if (existing?.usable && !this.hasBeenIdleTooLong(accountName)) {
+      this.imapClientsLastUsedAt.set(accountName, Date.now());
       return existing;
     }
 
@@ -98,7 +152,7 @@ export default class ConnectionManager implements IConnectionManager {
       return connecting;
     }
 
-    const attempt = this.openImapClient(accountName, existing);
+    const attempt = this.reviveOrOpenImapClient(accountName, existing);
     this.imapClientsConnecting.set(accountName, attempt);
     try {
       return await attempt;
@@ -107,6 +161,31 @@ export default class ConnectionManager implements IConnectionManager {
       // promise that has already rejected.
       this.imapClientsConnecting.delete(accountName);
     }
+  }
+
+  /**
+   * Reuse an idle connection if it still answers, otherwise build a new one.
+   *
+   * Runs inside the in-flight guard, so racing callers share one probe rather
+   * than each sending their own NOOP.
+   */
+  private async reviveOrOpenImapClient(
+    accountName: string,
+    existing?: ImapFlow,
+  ): Promise<ImapFlow> {
+    if (existing?.usable) {
+      if (await ConnectionManager.respondsToProbe(existing)) {
+        this.imapClientsLastUsedAt.set(accountName, Date.now());
+        return existing;
+      }
+      await mcpLog(
+        'info',
+        'imap',
+        `Idle connection for "${accountName}" did not answer; reconnecting`,
+      );
+    }
+
+    return this.openImapClient(accountName, existing);
   }
 
   /** Build, connect and cache a fresh IMAP client, discarding any stale one. */
@@ -143,6 +222,7 @@ export default class ConnectionManager implements IConnectionManager {
       `Connected to ${account.imap.host}:${account.imap.port} for "${accountName}"`,
     );
     this.imapClients.set(accountName, client);
+    this.imapClientsLastUsedAt.set(accountName, Date.now());
     return client;
   }
 
@@ -356,6 +436,7 @@ export default class ConnectionManager implements IConnectionManager {
           .catch(() => {})
           .then(() => {
             this.imapClients.delete(name);
+            this.imapClientsLastUsedAt.delete(name);
           }),
       );
     });

@@ -505,8 +505,20 @@ For single-account setups (overrides config file):
 | `MCP_EMAIL_SMTP_POOL_MAX_CONNECTIONS` | `1` | Max pooled SMTP connections |
 | `MCP_EMAIL_SMTP_POOL_MAX_MESSAGES` | `100` | Max messages per pooled connection |
 | `MCP_EMAIL_RATE_LIMIT` | `10` | Max sends per minute |
+| `MCP_EMAIL_IMAP_IDLE_PROBE_MS` | `60000` | Idle time after which a pooled IMAP connection is probed before reuse (`0` disables probing) |
+| `MCP_EMAIL_IMAP_PROBE_TIMEOUT_MS` | `5000` | How long that probe may take before the connection is rebuilt |
 
 ¹ One of `MCP_EMAIL_PASSWORD`, `MCP_EMAIL_PASSWORD_COMMAND`, or the OAuth2 variables is required.
+
+The two `MCP_EMAIL_IMAP_*` connection variables apply however accounts are
+configured, file or environment. IMAP connections are pooled for the life of
+the process, and `ImapFlow.usable` only turns false once the socket reports an
+error or close — a connection dropped silently (an idle session reaped by the
+server, a NAT mapping expiring without an RST) stays marked usable, so the next
+call issues its command into a dead socket and stalls until something times
+out. Probing a connection that has been idle past the threshold turns that
+stall into a fast reconnect. Raise the threshold to probe less often; set it to
+`0` to disable probing entirely and accept the stalls.
 
 ### Email Scheduling
 
