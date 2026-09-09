@@ -25,6 +25,7 @@ function createMockConnectionManager(mockTransport: ReturnType<typeof createMock
     }),
     getAccountNames: vi.fn().mockReturnValue(['test']),
     getImapClient: vi.fn(),
+    withImapClient: vi.fn(),
     getSmtpTransport: vi.fn().mockResolvedValue(mockTransport),
     closeAll: vi.fn(),
   } satisfies IConnectionManager;

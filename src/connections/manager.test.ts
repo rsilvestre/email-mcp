@@ -252,3 +252,117 @@ describe('ConnectionManager stale IMAP connection detection', () => {
     expect(imapInstances).toHaveLength(1);
   });
 });
+
+describe('ConnectionManager IMAP pooling', () => {
+  /** Resolve a promise from outside, to hold work open while asserting. */
+  function deferred() {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { held, release };
+  }
+
+  beforeEach(() => {
+    imapInstances.length = 0;
+    imapControl.failNextConnectCount = 0;
+    imapControl.probeBehaviour = 'ok';
+  });
+
+  it('spreads a burst of work across several connections', async () => {
+    const manager = new ConnectionManager([account]);
+    const gate = deferred();
+
+    // Twenty tasks dispatched in one tick, as get_emails does. All of them see
+    // the pool before any connection has finished opening, which is exactly the
+    // case a lazily-grown pool gets wrong.
+    const tasks = Array.from({ length: 20 }, async () =>
+      manager.withImapClient('test', async () => gate.held),
+    );
+
+    await Promise.resolve();
+    gate.release();
+    await Promise.all(tasks);
+
+    expect(imapInstances).toHaveLength(3);
+  });
+
+  it('never exceeds the pool ceiling', async () => {
+    const manager = new ConnectionManager([account]);
+    const gate = deferred();
+
+    const tasks = Array.from({ length: 50 }, async () =>
+      manager.withImapClient('test', async () => gate.held),
+    );
+
+    await Promise.resolve();
+    gate.release();
+    await Promise.all(tasks);
+
+    expect(imapInstances.length).toBeLessThanOrEqual(3);
+  });
+
+  it('opens only one connection for sequential work', async () => {
+    const manager = new ConnectionManager([account]);
+
+    // Growth is driven by work actually waiting, not by how many calls happen.
+    for (let call = 0; call < 10; call += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await manager.withImapClient('test', async () => undefined);
+    }
+
+    expect(imapInstances).toHaveLength(1);
+  });
+
+  it('does not grow the pool for getImapClient callers', async () => {
+    const manager = new ConnectionManager([account]);
+
+    // A bare client hands out no signal about when it is finished, so growing
+    // here would open sockets nothing measured the need for.
+    await Promise.all(Array.from({ length: 10 }, async () => manager.getImapClient('test')));
+
+    expect(imapInstances).toHaveLength(1);
+  });
+
+  it('runs the task on a connected client', async () => {
+    const manager = new ConnectionManager([account]);
+
+    const seen = await manager.withImapClient('test', async (client) => client);
+
+    expect(imapInstances[0]).toBe(seen as unknown as MockClient);
+    expect((seen as unknown as MockClient).connect).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases its slot when the task throws', async () => {
+    const manager = new ConnectionManager([account]);
+
+    await expect(
+      manager.withImapClient('test', async () => {
+        throw new Error('fetch failed');
+      }),
+    ).rejects.toThrow('fetch failed');
+
+    // The in-flight count must come back down, or the next call would think the
+    // connection is busy and open another for nothing.
+    await manager.withImapClient('test', async () => undefined);
+    expect(imapInstances).toHaveLength(1);
+  });
+
+  it('closes every pooled connection on shutdown', async () => {
+    const manager = new ConnectionManager([account]);
+    const gate = deferred();
+
+    const tasks = Array.from({ length: 20 }, async () =>
+      manager.withImapClient('test', async () => gate.held),
+    );
+    await Promise.resolve();
+    gate.release();
+    await Promise.all(tasks);
+
+    await manager.closeAll();
+
+    expect(imapInstances).toHaveLength(3);
+    const loggedOut = imapInstances.filter((client) => client.logout.mock.calls.length > 0);
+    expect(loggedOut).toHaveLength(imapInstances.length);
+  });
+});

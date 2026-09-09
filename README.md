@@ -507,11 +507,12 @@ For single-account setups (overrides config file):
 | `MCP_EMAIL_RATE_LIMIT` | `10` | Max sends per minute |
 | `MCP_EMAIL_IMAP_IDLE_PROBE_MS` | `60000` | Idle time after which a pooled IMAP connection is probed before reuse (`0` disables probing) |
 | `MCP_EMAIL_IMAP_PROBE_TIMEOUT_MS` | `5000` | How long that probe may take before the connection is rebuilt |
+| `MCP_EMAIL_IMAP_POOL_SIZE` | `3` | Most IMAP connections opened per account for concurrent work |
 | `MCP_EMAIL_IMAP_DISABLE_COMPRESSION` | `false` | Set `true` to skip COMPRESS=DEFLATE (profiling and proxy traces) |
 
 ¹ One of `MCP_EMAIL_PASSWORD`, `MCP_EMAIL_PASSWORD_COMMAND`, or the OAuth2 variables is required.
 
-The two `MCP_EMAIL_IMAP_*` connection variables apply however accounts are
+The `MCP_EMAIL_IMAP_*` connection variables apply however accounts are
 configured, file or environment. IMAP connections are pooled for the life of
 the process, and `ImapFlow.usable` only turns false once the socket reports an
 error or close — a connection dropped silently (an idle session reaped by the
@@ -520,6 +521,15 @@ call issues its command into a dead socket and stalls until something times
 out. Probing a connection that has been idle past the threshold turns that
 stall into a fast reconnect. Raise the threshold to probe less often; set it to
 `0` to disable probing entirely and accept the stalls.
+
+`MCP_EMAIL_IMAP_POOL_SIZE` bounds how many IMAP connections one account may
+use at once. imapflow runs commands on a connection one at a time, so tools
+that fan out — reading twenty messages, or listing folders with their unread
+counts — otherwise run single file no matter how they are written. Extra
+connections open only while work is actually waiting, never for sequential
+calls, and are closed at shutdown. Lower it to `1` for a server with a tight
+per-account connection limit; that restores the older, fully sequential
+behaviour.
 
 `MCP_EMAIL_IMAP_DISABLE_COMPRESSION` exists for measurement. Compression is
 on by default and worth keeping: the only reason to turn it off is that the

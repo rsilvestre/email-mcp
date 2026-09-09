@@ -245,6 +245,9 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
  * server then refuses, and a message with an unreadable body is still worth
  * returning with its headers intact.
  */
+/** Counters asked of every folder when listing mailboxes. */
+const MAILBOX_STATUS_FIELDS = { messages: true, unseen: true } as const;
+
 /**
  * First batch of UIDs examined when a filter has to be applied client-side.
  *
@@ -460,12 +463,13 @@ export default class ImapService {
     const client = await this.connections.getImapClient(accountName);
     const mailboxes = await client.list();
 
+    // One STATUS per folder. Issued through the pool so they genuinely overlap:
+    // on a single connection imapflow runs them in turn, which on a 24-folder
+    // account is 24 sequential round trips.
     const statusResults = await Promise.allSettled(
       mailboxes.map(async (mb) => {
-        const status = await client.status(mb.path, {
-          messages: true,
-          unseen: true,
-        });
+        const readStatus = async (c: ImapFlow) => c.status(mb.path, MAILBOX_STATUS_FIELDS);
+        const status = await this.connections.withImapClient(accountName, readStatus);
         return {
           name: mb.name,
           path: mb.path,
@@ -634,7 +638,18 @@ export default class ImapService {
   // -------------------------------------------------------------------------
 
   async getEmail(accountName: string, emailId: string, mailbox = 'INBOX'): Promise<Email> {
-    const client = await this.connections.getImapClient(accountName);
+    // Through the pool rather than the shared connection: get_emails fans out
+    // over as many as 20 ids, and on one connection those run strictly in turn.
+    const readEmail = async (c: ImapFlow) => ImapService.fetchEmailOn(c, emailId, mailbox);
+    return this.connections.withImapClient(accountName, readEmail);
+  }
+
+  /** Read one message on a given connection. */
+  private static async fetchEmailOn(
+    client: ImapFlow,
+    emailId: string,
+    mailbox: string,
+  ): Promise<Email> {
     const uid = parseInt(emailId, 10);
     const safeMailbox = sanitizeMailboxName(mailbox);
 

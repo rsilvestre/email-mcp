@@ -1,3 +1,4 @@
+import type { ImapFlow } from 'imapflow';
 import type { IConnectionManager } from '../connections/types.js';
 import ImapService from './imap.service.js';
 
@@ -37,6 +38,11 @@ function createMockConnectionManager(mockClient: ReturnType<typeof createMockIma
     }),
     getAccountNames: vi.fn().mockReturnValue(['test']),
     getImapClient: vi.fn().mockResolvedValue(mockClient),
+    // A plain function, not vi.fn: the mock factory erases the generic, and the
+    // pool hands work the same client this mock exposes anyway, so tests
+    // observe the pooled and non-pooled paths identically.
+    withImapClient: async <T>(_account: string, task: (client: ImapFlow) => Promise<T>) =>
+      task(mockClient as unknown as ImapFlow),
     getSmtpTransport: vi.fn(),
     closeAll: vi.fn(),
   } satisfies IConnectionManager;

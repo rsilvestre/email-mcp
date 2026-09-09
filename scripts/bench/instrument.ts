@@ -167,18 +167,34 @@ export class InstrumentedConnectionManager implements IConnectionManager {
     return this.delegate.closeAll();
   }
 
+  /**
+   * Pooled work, instrumented the same way.
+   *
+   * Delegating rather than reimplementing keeps the benchmark on the exact code
+   * path the server uses, including how work is distributed across connections.
+   */
+  async withImapClient<T>(accountName: string, task: (client: ImapFlow) => Promise<T>): Promise<T> {
+    return this.delegate.withImapClient(accountName, async (client) => {
+      this.instrument(client as InstrumentableClient);
+      return task(client);
+    });
+  }
+
   async getImapClient(accountName: string): Promise<ImapFlow> {
     const client = (await this.delegate.getImapClient(accountName)) as InstrumentableClient;
+    this.instrument(client);
+    return client;
+  }
 
+  /** Fit a client with the counting logger and open its byte baseline. */
+  private instrument(client: InstrumentableClient): void {
     if (!this.instrumentedClients.has(client)) {
       this.attachCountingLogger(client);
       this.instrumentedClients.add(client);
     }
-
-    // Sample the socket on the way out so a window that only reuses an existing
-    // client still establishes its byte baseline.
+    // Sample the socket here so a window that only reuses an existing client
+    // still establishes its byte baseline.
     this.recorder.observeSocket(client.socket, 'open');
-    return client;
   }
 
   /**
