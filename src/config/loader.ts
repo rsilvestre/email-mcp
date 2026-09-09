@@ -172,6 +172,7 @@ async function normalizeAccount(raw: RawAccountConfig): Promise<AccountConfig> {
     passwordCommand: raw.password_command,
     oauth2: raw.oauth2 ? normalizeOAuth2(raw.oauth2) : undefined,
     sentMailbox: raw.sent_mailbox,
+    imapPoolSize: raw.imap_pool_size,
     saveToSent: raw.save_to_sent,
     imap: {
       host: raw.imap.host,

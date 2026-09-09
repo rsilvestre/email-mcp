@@ -370,6 +370,7 @@ email = "you@gmail.com"
 full_name = "Your Name"
 password = "your-app-password"
 # sent_mailbox = "INBOX.Sent Messages"   # optional, see below
+# imap_pool_size = 8                     # optional, see below
 # save_to_sent = false                    # optional; skipped on Gmail by default
 
 [accounts.imap]
@@ -435,6 +436,24 @@ name = "personal"
 email = "you@example.com"
 sent_mailbox = "INBOX.Sent Messages"
 ```
+
+### `imap_pool_size`
+
+How many IMAP connections this account may open at once. Defaults to
+`MCP_EMAIL_IMAP_POOL_SIZE` (3).
+
+Worth raising only for an account whose server has no full-text index, where a
+wide search has to visit every folder in turn. That cost is round-trip latency
+rather than server work — measured at about 280 ms per folder whether it holds
+nothing or several hundred messages — so the account gets through its folders
+roughly in proportion to the connections allowed. An account measured here with
+309 folders reached 95 of them within the search deadline on three connections.
+
+Check what the server permits before raising it; the one measured here accepted
+twelve. An account whose server does index its mail gains nothing: Gmail covers
+every label with a single All Mail search, and spare connections only take
+throughput from the one doing the work.
+
 
 Use the folder's full IMAP path, as `list_mailboxes` reports it. When the copy cannot be filed, the
 message is still sent and the tool result says where it failed.
@@ -542,10 +561,21 @@ second across 147 labels, because a single All Mail search covers every one of
 them. A server without an index is linear in folders, and an account measured
 here with 309 folders took 77 seconds for the same query. Past the deadline the
 search returns what it has and names the folders it skipped, so a partial answer
-is never mistaken for a complete one. On such a server a wide search also looks
-at headers only, since scanning bodies costs about five times as much per
-folder; the result says so, and `scope: "mailbox"` still searches bodies in a
-named folder.
+is never mistaken for a complete one.
+
+On such a server the body term is decided per folder, from the size SELECT
+reports anyway. The scan is what costs, and it is proportional to the folder:
+measured at 276 ms on a twenty-message folder against 262 ms for headers alone,
+but 4223 ms on a folder of several hundred. So bodies are searched everywhere
+except the few large folders, which the result names.
+
+Where an account's folders are searched one by one, the cost is round-trip
+latency rather than server work — about 280 ms per folder whether it holds
+nothing or several hundred messages — so such an account gets through its
+folders roughly in proportion to the connections it may open. Set
+`imap_pool_size` on that account (see the account options above) rather than
+raising the global default, which would open connections that indexed accounts
+have no use for.
 
 `MCP_EMAIL_IMAP_DISABLE_COMPRESSION` exists for measurement. Compression is
 on by default and worth keeping: the only reason to turn it off is that the

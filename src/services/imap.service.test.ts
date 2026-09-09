@@ -1151,15 +1151,23 @@ describe('ImapService.searchAcross', () => {
    * and in production every connection carries its own selected mailbox. A
    * single shared mock would let one folder's selection overwrite another's.
    */
-  function respondPerFolder(datesByMailbox: Record<string, string>, unselectable: string[] = []) {
+  function respondPerFolder(
+    datesByMailbox: Record<string, string>,
+    unselectable: string[] = [],
+    sizesByMailbox: Record<string, number> = {},
+  ) {
     connections.withImapClient = async <T>(_a: string, task: (c: ImapFlow) => Promise<T>) => {
       let current = '';
       const perCall = {
         capabilities: client.capabilities,
         list: client.list,
+        // SELECT reports the folder's size, which is how the search decides
+        // whether including message bodies is affordable.
+        mailbox: undefined as { exists: number } | undefined,
         getMailboxLock: async (mailbox: string) => {
           if (unselectable.includes(mailbox)) throw new Error('NO [SERVERBUG] cannot select');
           current = mailbox;
+          perCall.mailbox = { exists: sizesByMailbox[mailbox] ?? 0 };
           return { release: vi.fn() };
         },
         search: async (criteria: Record<string, unknown>) => {
@@ -1229,17 +1237,39 @@ describe('ImapService.searchAcross', () => {
     expect(result.items).toHaveLength(2);
   });
 
-  it('leaves bodies out of a wide search on a server with no index', async () => {
+  // On a server with no index the cost of a body search is the scan, and the
+  // scan is proportional to the folder — measured at 276 ms on a twenty-message
+  // folder against 262 ms for headers alone, but 4223 ms on a folder of several
+  // hundred. So bodies are worth searching almost everywhere.
+  it('still searches bodies in small folders on a server with no index', async () => {
     client.capabilities = new Set<string>();
     client.list.mockResolvedValue(plainFolders());
-    respondPerFolder({ INBOX: '2026-03-01' });
+    respondPerFolder({ INBOX: '2026-03-01' }, [], { INBOX: 12, Archives: 5 });
 
     const result = await service.searchAcross(['test'], 'Klakedelle', {});
 
     const terms = (visited[0]?.criteria.or ?? []) as Record<string, string>[];
-    expect(terms.some((term) => 'body' in term)).toBe(false);
-    // Silently narrowing the query would make an incomplete answer look whole.
-    expect(result.bodyNotSearched).toEqual(['test']);
+    expect(terms.some((term) => 'body' in term)).toBe(true);
+    expect(result.bodyNotSearched).toBeUndefined();
+  });
+
+  it('drops the body term only on a folder large enough to matter', async () => {
+    client.capabilities = new Set<string>();
+    client.list.mockResolvedValue(plainFolders());
+    respondPerFolder({ INBOX: '2026-03-01', Archives: '2026-02-01' }, [], {
+      INBOX: 5_000,
+      Archives: 8,
+    });
+
+    const result = await service.searchAcross(['test'], 'Klakedelle', {});
+
+    const forInbox = visited.find((v) => v.mailbox === 'INBOX');
+    const forArchives = visited.find((v) => v.mailbox === 'Archives');
+    expect(((forInbox?.criteria.or ?? []) as object[]).some((t) => 'body' in t)).toBe(false);
+    expect(((forArchives?.criteria.or ?? []) as object[]).some((t) => 'body' in t)).toBe(true);
+    // Naming the folder is the point: silently narrowing the query would make
+    // an incomplete answer look whole.
+    expect(result.bodyNotSearched).toEqual(['INBOX']);
   });
 
   it('tags every result with the account and folder it came from', async () => {

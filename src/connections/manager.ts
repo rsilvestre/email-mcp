@@ -45,7 +45,7 @@ const DISABLE_COMPRESSION = process.env.MCP_EMAIL_IMAP_DISABLE_COMPRESSION === '
  * never for sequential use. Servers cap simultaneous connections per account
  * (Gmail allows 15), so this stays small.
  */
-const POOL_MAX = Math.max(1, Number(process.env.MCP_EMAIL_IMAP_POOL_SIZE ?? 3));
+const POOL_MAX_DEFAULT = Math.max(1, Number(process.env.MCP_EMAIL_IMAP_POOL_SIZE ?? 3));
 
 export default class ConnectionManager implements IConnectionManager {
   /** Connections per account, each possibly still opening. */
@@ -197,6 +197,19 @@ export default class ConnectionManager implements IConnectionManager {
     }
   }
 
+  /**
+   * How many connections this account may open.
+   *
+   * Per-account because the right number depends on the server: one that
+   * indexes its mail answers a wide search in a single command, while one that
+   * does not is searched folder by folder and gets through them roughly in
+   * proportion to the connections allowed.
+   */
+  private poolLimitFor(accountName: string): number {
+    const configured = this.accounts.get(accountName)?.imapPoolSize;
+    return configured ? Math.max(1, configured) : POOL_MAX_DEFAULT;
+  }
+
   private selectImapConnection(accountName: string, allowGrowth: boolean): PooledImapConnection {
     this.reapIdleSpareConnections(accountName);
 
@@ -209,7 +222,7 @@ export default class ConnectionManager implements IConnectionManager {
     if (leastLoaded === undefined) {
       return this.addImapConnection(accountName);
     }
-    if (allowGrowth && leastLoaded.inFlight > 0 && pool.length < POOL_MAX) {
+    if (allowGrowth && leastLoaded.inFlight > 0 && pool.length < this.poolLimitFor(accountName)) {
       return this.addImapConnection(accountName);
     }
     return leastLoaded;

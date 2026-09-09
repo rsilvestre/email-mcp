@@ -623,12 +623,15 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
                 .slice(0, 5)
                 .join(', ')}${andMore}. Narrow the scope, or search those folders directly.`
             : '';
-        const headersOnly = result.bodyNotSearched?.length
-          ? `\nℹ️ Message bodies were not searched on ${result.bodyNotSearched.join(', ')} — ` +
-            `that server has no full-text index, and scanning bodies across its folders costs ` +
-            `about five times as much. Subjects, senders and recipients were searched. ` +
-            `Use scope "mailbox" on a specific folder to search its bodies.`
-          : '';
+        const noBody = result.bodyNotSearched ?? [];
+        const headersOnly =
+          noBody.length > 0
+            ? `\nℹ️ Only subjects, senders and recipients were searched in these folders, which are large enough that scanning their bodies would have cost more than the rest of the search put together: ${noBody
+                .slice(0, 5)
+                .join(
+                  ', ',
+                )}${noBody.length > 5 ? ` and ${noBody.length - 5} more` : ''}. Message bodies were searched everywhere else. Use scope "mailbox" on one of these to search its bodies.`
+            : '';
         const header =
           `🔍 [${where}] ${formatResultCount(result)} result(s) for ${queryLabel}` +
           `${result.hasMore ? ' — more pages available' : ''}${partial}${headersOnly}\n`;

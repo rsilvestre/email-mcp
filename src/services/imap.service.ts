@@ -266,6 +266,21 @@ const MAX_CANDIDATES_PER_SOURCE = 200;
  */
 const CROSS_FOLDER_DEADLINE_MS = Number(process.env.MCP_EMAIL_SEARCH_DEADLINE_MS ?? 15_000);
 
+/**
+ * Folder size up to which searching message bodies is affordable on a server
+ * with no full-text index.
+ *
+ * Measured against one such account: a body search costs 276 ms on a folder of
+ * twenty messages against 262 ms for headers alone — the round trip dominates,
+ * the scan is free. The same search costs 4223 ms on a folder of several
+ * hundred. So the body term is worth including almost everywhere, and worth
+ * dropping only on the handful of large folders.
+ *
+ * The size comes from the SELECT the search performs anyway, so deciding this
+ * per folder costs nothing.
+ */
+const BODY_SEARCH_MAX_MESSAGES = 50;
+
 /** Counters asked of every folder when listing mailboxes. */
 const MAILBOX_STATUS_FIELDS = { messages: true, unseen: true } as const;
 
@@ -945,7 +960,12 @@ export default class ImapService {
 
   /** What every folder in one cross-folder search has in common. */
   private static asSearchPlan(plan: {
-    criteria: Record<string, unknown>;
+    /** Used where the server indexes, or where the folder is small enough. */
+    criteriaWithBody: Record<string, unknown>;
+    /** Used on a large folder of a server that has to scan for a body match. */
+    criteriaHeadersOnly: Record<string, unknown>;
+    /** True when the server indexes, so folder size does not matter. */
+    indexed: boolean;
     candidateLimit: number;
     withPreview: boolean;
   }) {
@@ -957,11 +977,24 @@ export default class ImapService {
     accountName: string,
     mailbox: string,
     plan: ReturnType<typeof ImapService.asSearchPlan>,
-  ): Promise<{ metas: EmailMeta[]; matched: number; capped: boolean }> {
-    const { criteria, candidateLimit, withPreview } = plan;
+  ): Promise<{
+    mailbox: string;
+    metas: EmailMeta[];
+    matched: number;
+    capped: boolean;
+    bodySkipped: boolean;
+  }> {
+    const { candidateLimit, withPreview } = plan;
     return this.connections.withImapClient(accountName, async (client) => {
       const lock = await client.getMailboxLock(mailbox);
       try {
+        // SELECT has just reported how many messages the folder holds, so
+        // choosing here costs nothing.
+        const selected = client.mailbox;
+        const messageCount = typeof selected === 'object' ? (selected.exists ?? 0) : 0;
+        const affordable = plan.indexed || messageCount <= BODY_SEARCH_MAX_MESSAGES;
+        const criteria = affordable ? plan.criteriaWithBody : plan.criteriaHeadersOnly;
+
         const found = await client.search(criteria, { uid: true });
         const uids = (Array.isArray(found) ? found : []).sort((a, b) => b - a);
         // UIDs rise with arrival, so the newest by UID are the newest by date.
@@ -970,9 +1003,11 @@ export default class ImapService {
         const candidates = uids.slice(0, candidateLimit);
         const metas = await ImapService.fetchMetasFor(client, candidates, withPreview);
         return {
+          mailbox,
           metas: metas.map((meta) => ({ ...meta, account: accountName, mailbox })),
           matched: uids.length,
           capped: uids.length > candidates.length,
+          bodySkipped: !affordable,
         };
       } finally {
         lock.release();
@@ -1023,7 +1058,7 @@ export default class ImapService {
 
     const collected: EmailMeta[] = [];
     const incompleteSources: string[] = [];
-    const headersOnlyAccounts: string[] = [];
+    const bodySkippedFolders: string[] = [];
     let matched = 0;
     let capped = false;
 
@@ -1033,13 +1068,13 @@ export default class ImapService {
           const client = await this.connections.getImapClient(accountName);
           const { mailboxes, indexed } = await ImapService.searchableMailboxes(client);
 
-          // Fanning a body search across many folders on a server that does not
-          // index is what makes these searches unusable. Headers only there.
-          const includeBody = indexed || mailboxes.length === 1;
-          if (!includeBody) headersOnlyAccounts.push(accountName);
-
+          // The body term is decided per folder, once SELECT has said how big
+          // the folder is — see BODY_SEARCH_MAX_MESSAGES. Both variants are
+          // built once here rather than per folder.
           const plan = ImapService.asSearchPlan({
-            criteria: ImapService.buildSearchCriteria(sanitizedQuery, options, includeBody),
+            criteriaWithBody: ImapService.buildSearchCriteria(sanitizedQuery, options, true),
+            criteriaHeadersOnly: ImapService.buildSearchCriteria(sanitizedQuery, options, false),
+            indexed,
             candidateLimit,
             withPreview,
           });
@@ -1066,6 +1101,7 @@ export default class ImapService {
         collected.push(...outcome.value.metas);
         matched += outcome.value.matched;
         capped ||= outcome.value.capped;
+        if (outcome.value.bodySkipped) bodySkippedFolders.push(outcome.value.mailbox);
       });
     } finally {
       if (deadlineTimer) clearTimeout(deadlineTimer);
@@ -1092,7 +1128,7 @@ export default class ImapService {
       // floor, not a total.
       ...(capped || incompleteSources.length > 0 ? { totalIsLowerBound: true } : {}),
       ...(incompleteSources.length > 0 ? { incompleteSources } : {}),
-      ...(headersOnlyAccounts.length > 0 ? { bodyNotSearched: headersOnlyAccounts } : {}),
+      ...(bodySkippedFolders.length > 0 ? { bodyNotSearched: bodySkippedFolders } : {}),
     };
   }
 

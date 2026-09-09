@@ -75,6 +75,19 @@ export interface AccountConfig {
    */
   sentMailbox?: string;
   /**
+   * IMAP connections this account may open at once, overriding the global
+   * default.
+   *
+   * What an account needs depends on how its server answers a wide search. A
+   * server that indexes its mail needs one connection: Gmail covers every label
+   * with a single All Mail search. A server without one is searched folder by
+   * folder, and that cost is round-trip latency rather than server work —
+   * measured at ~280 ms per folder whether the folder holds nothing or several
+   * hundred messages. Such an account gets through its folders roughly in
+   * proportion to the connections it is allowed.
+   */
+  imapPoolSize?: number;
+  /**
    * File a copy of outgoing mail in the Sent folder. Defaults to true, except
    * on servers that already file sent mail themselves — see appendToSent.
    */
@@ -312,13 +325,14 @@ export interface PaginatedResult<T> {
    */
   incompleteSources?: string[];
   /**
-   * Accounts whose message bodies were not searched, only their headers.
+   * Folders whose message bodies were not searched, only their headers.
    *
-   * A server with no full-text index scans each message to answer a body
-   * search — measured here at 5.3x the cost of a header-only search, per
-   * folder. Across hundreds of folders that is the difference between a usable
-   * answer and none, so a wide search on such a server searches headers only
-   * and says which accounts that applied to.
+   * On a server with no full-text index the cost of a body search is all in the
+   * scan, and the scan is proportional to the folder: measured at 276 ms on a
+   * twenty-message folder against 262 ms for headers alone, but 4223 ms on a
+   * folder of several hundred. Bodies are therefore searched everywhere except
+   * the few folders large enough to be worth skipping, and those are named
+   * rather than silently omitted.
    */
   bodyNotSearched?: string[];
 }
