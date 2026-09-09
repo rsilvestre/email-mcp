@@ -461,11 +461,25 @@ export default class ImapService {
 
   async listMailboxes(accountName: string): Promise<Mailbox[]> {
     const client = await this.connections.getImapClient(accountName);
-    const mailboxes = await client.list();
 
-    // One STATUS per folder. Issued through the pool so they genuinely overlap:
-    // on a single connection imapflow runs them in turn, which on a 24-folder
-    // account is 24 sequential round trips.
+    // LIST-STATUS (RFC 5819) returns every folder's counters inline with the
+    // folder list, turning what was LIST plus one STATUS per folder into a
+    // single command. Gmail advertises it; a plain Dovecot may not.
+    if (client.capabilities.has('LIST-STATUS')) {
+      const listed = await client.list({ statusQuery: MAILBOX_STATUS_FIELDS });
+      return listed.map((mb) => ({
+        name: mb.name,
+        path: mb.path,
+        specialUse: mb.specialUse ?? undefined,
+        totalMessages: mb.status?.messages ?? 0,
+        unseenMessages: mb.status?.unseen ?? 0,
+      }));
+    }
+
+    // Without the extension it is one STATUS per folder. Issued through the
+    // pool so they genuinely overlap — imapflow's own fallback would run them
+    // in turn on a single connection.
+    const mailboxes = await client.list();
     const statusResults = await Promise.allSettled(
       mailboxes.map(async (mb) => {
         const readStatus = async (c: ImapFlow) => c.status(mb.path, MAILBOX_STATUS_FIELDS);

@@ -980,3 +980,58 @@ describe('ImapService.getThread', () => {
     expect(thread.messageCount).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// listMailboxes
+// ---------------------------------------------------------------------------
+
+describe('ImapService.listMailboxes', () => {
+  let client: ReturnType<typeof createMockImapClient>;
+  let service: ImapService;
+
+  beforeEach(() => {
+    client = createMockImapClient();
+    service = new ImapService(createMockConnectionManager(client));
+  });
+
+  it('asks for counters inline when the server supports LIST-STATUS', async () => {
+    client.capabilities = new Set(['LIST-STATUS']);
+    client.list.mockResolvedValue([
+      { name: 'INBOX', path: 'INBOX', status: { messages: 1709, unseen: 711 } },
+      { name: 'Klakedelle', path: 'Klakedelle', status: { messages: 107, unseen: 2 } },
+    ]);
+
+    const mailboxes = await service.listMailboxes('test');
+
+    // One command for the whole account instead of LIST plus a STATUS each.
+    expect(client.status).not.toHaveBeenCalled();
+    expect(client.list.mock.calls[0]?.[0]).toEqual({
+      statusQuery: { messages: true, unseen: true },
+    });
+    expect(mailboxes[0]).toMatchObject({ path: 'INBOX', totalMessages: 1709, unseenMessages: 711 });
+  });
+
+  it('falls back to one STATUS per folder without the extension', async () => {
+    client.capabilities = new Set<string>();
+    client.list.mockResolvedValue([
+      { name: 'INBOX', path: 'INBOX' },
+      { name: 'Travaux', path: 'Travaux' },
+    ]);
+    client.status.mockResolvedValue({ messages: 11, unseen: 1 });
+
+    const mailboxes = await service.listMailboxes('test');
+
+    expect(client.status).toHaveBeenCalledTimes(2);
+    expect(mailboxes[1]).toMatchObject({ path: 'Travaux', totalMessages: 11 });
+  });
+
+  it('reports zero for a folder whose counters are missing', async () => {
+    client.capabilities = new Set(['LIST-STATUS']);
+    client.list.mockResolvedValue([{ name: '[Gmail]', path: '[Gmail]' }]);
+
+    const mailboxes = await service.listMailboxes('test');
+
+    // \Noselect containers come back without a STATUS section.
+    expect(mailboxes[0]).toMatchObject({ totalMessages: 0, unseenMessages: 0 });
+  });
+});
