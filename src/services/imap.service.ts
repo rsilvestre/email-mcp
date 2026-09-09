@@ -245,6 +245,27 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
  * server then refuses, and a message with an unreadable body is still worth
  * returning with its headers intact.
  */
+/**
+ * Most matches pulled from any one folder when merging results.
+ *
+ * A cross-folder search has to sort by date across sources, which needs each
+ * candidate's envelope. Without a ceiling, a broad query on a large mailbox
+ * would fetch envelopes for everything it matched just to show twenty rows.
+ */
+const MAX_CANDIDATES_PER_SOURCE = 200;
+
+/**
+ * How long a search spanning several folders may run before returning what it
+ * has.
+ *
+ * A server that indexes its mail answers whatever the folder count: Gmail
+ * returns in well under a second across 147 labels, because All Mail is one
+ * search. A server without an index is linear in folders and in message size —
+ * an account measured here with 309 folders took 77 seconds for the same
+ * query. Waiting that long is worse than a partial answer that says so.
+ */
+const CROSS_FOLDER_DEADLINE_MS = Number(process.env.MCP_EMAIL_SEARCH_DEADLINE_MS ?? 15_000);
+
 /** Counters asked of every folder when listing mailboxes. */
 const MAILBOX_STATUS_FIELDS = { messages: true, unseen: true } as const;
 
@@ -809,6 +830,272 @@ export default class ImapService {
   // Search emails
   // -------------------------------------------------------------------------
 
+  /**
+   * Build the IMAP SEARCH criteria shared by the single- and multi-folder paths.
+   */
+  private static buildSearchCriteria(
+    sanitizedQuery: string,
+    options: {
+      to?: string;
+      largerThan?: number;
+      smallerThan?: number;
+      answered?: boolean;
+    },
+    includeBody = true,
+  ): Record<string, unknown> {
+    // Base query ORs across subject, sender and — where it is affordable — body.
+    const terms: Record<string, unknown>[] = [
+      { subject: sanitizedQuery },
+      { from: sanitizedQuery },
+      ...(includeBody ? [{ body: sanitizedQuery }] : []),
+    ];
+    const baseCriteria: Record<string, unknown> = sanitizedQuery ? { or: terms } : {};
+
+    const andConditions: Record<string, unknown>[] = [baseCriteria];
+    if (options.to) {
+      andConditions.push({ to: options.to });
+    }
+    if (options.largerThan !== undefined) {
+      andConditions.push({ larger: options.largerThan * 1024 });
+    }
+    if (options.smallerThan !== undefined) {
+      andConditions.push({ smaller: options.smallerThan * 1024 });
+    }
+    if (options.answered === true) {
+      andConditions.push({ answered: true });
+    } else if (options.answered === false) {
+      andConditions.push({ answered: false });
+    }
+
+    if (andConditions.length === 1) return baseCriteria;
+
+    const combined: Record<string, unknown> = {};
+    andConditions.forEach((condition) => {
+      Object.assign(combined, condition);
+    });
+    return combined;
+  }
+
+  /** Fetch listing metadata for a set of UIDs in the currently selected mailbox. */
+  private static async fetchMetasFor(
+    client: ImapFlow,
+    uids: number[],
+    withPreview: boolean,
+  ): Promise<EmailMeta[]> {
+    if (uids.length === 0) return [];
+
+    const raw: Record<string, unknown>[] = [];
+    // eslint-disable-next-line no-restricted-syntax
+    for await (const msg of client.fetch(
+      uids.join(','),
+      {
+        uid: true,
+        envelope: true,
+        flags: true,
+        bodyStructure: true,
+        headers: BULK_HEADER_FIELDS,
+        ...(withPreview
+          ? { bodyParts: [{ key: '1', start: 0, maxLength: PREVIEW_PART_BYTES }] }
+          : {}),
+      },
+      { uid: true },
+    )) {
+      raw.push(msg as unknown as Record<string, unknown>);
+    }
+
+    if (withPreview) {
+      await fetchNestedPreviews(client, raw);
+    }
+
+    return raw.map((msg) => messageToEmailMeta(msg));
+  }
+
+  /**
+   * Folders worth searching for an account.
+   *
+   * Gmail files every message under All Mail whatever labels it carries, so one
+   * folder covers the whole account. Elsewhere it means every real folder;
+   * Trash and Junk are left out, which is also what All Mail excludes.
+   */
+  private static async searchableMailboxes(
+    client: ImapFlow,
+  ): Promise<{ mailboxes: string[]; indexed: boolean }> {
+    const mailboxes = await client.list();
+
+    const allMail = mailboxes.find((mb) => mb.specialUse === '\\All');
+    if (allMail && client.capabilities.has('X-GM-EXT-1')) {
+      // One folder holding every message, searched by the server's own index.
+      return { mailboxes: [allMail.path], indexed: true };
+    }
+
+    const skipped = new Set(['\\All', '\\Flagged', '\\Trash', '\\Junk']);
+    const searchable = mailboxes
+      .filter((mb) => mb.listed && !mb.flags?.has('\\Noselect'))
+      .filter(
+        (mb) => !skipped.has(mb.specialUse ?? '') && ![...skipped].some((f) => mb.flags?.has(f)),
+      );
+
+    // Most likely first, so a search cut short by the deadline has spent its
+    // time on the folders the answer is most likely to be in.
+    return {
+      mailboxes: ImapService.orderByLikelihood(searchable).map((mb) => mb.path),
+      indexed: false,
+    };
+  }
+
+  /** What every folder in one cross-folder search has in common. */
+  private static asSearchPlan(plan: {
+    criteria: Record<string, unknown>;
+    candidateLimit: number;
+    withPreview: boolean;
+  }) {
+    return plan;
+  }
+
+  /** Search one folder and return its newest matches, tagged with their source. */
+  private async searchOneMailbox(
+    accountName: string,
+    mailbox: string,
+    plan: ReturnType<typeof ImapService.asSearchPlan>,
+  ): Promise<{ metas: EmailMeta[]; matched: number; capped: boolean }> {
+    const { criteria, candidateLimit, withPreview } = plan;
+    return this.connections.withImapClient(accountName, async (client) => {
+      const lock = await client.getMailboxLock(mailbox);
+      try {
+        const found = await client.search(criteria, { uid: true });
+        const uids = (Array.isArray(found) ? found : []).sort((a, b) => b - a);
+        // UIDs rise with arrival, so the newest by UID are the newest by date.
+        // Taking only as many as a page could need keeps the envelope fetch
+        // bounded no matter how many messages matched.
+        const candidates = uids.slice(0, candidateLimit);
+        const metas = await ImapService.fetchMetasFor(client, candidates, withPreview);
+        return {
+          metas: metas.map((meta) => ({ ...meta, account: accountName, mailbox })),
+          matched: uids.length,
+          capped: uids.length > candidates.length,
+        };
+      } finally {
+        lock.release();
+      }
+    });
+  }
+
+  /**
+   * Search across folders, and optionally across accounts.
+   *
+   * Every source is searched by the server; nothing is filtered here. Results
+   * carry the account and folder they came from, because a UID is meaningless
+   * without them — a caller cannot move or delete a result otherwise.
+   */
+  async searchAcross(
+    scope: string[] | 'all',
+    query: string,
+    options: {
+      page?: number;
+      pageSize?: number;
+      to?: string;
+      largerThan?: number;
+      smallerThan?: number;
+      answered?: boolean;
+      preview?: boolean;
+    } = {},
+  ): Promise<PaginatedResult<EmailMeta>> {
+    // Resolving 'all' here keeps the account list out of the tool layer, which
+    // has no connection manager of its own.
+    const accountNames = scope === 'all' ? this.connections.getAccountNames() : scope;
+
+    const page = options.page ?? 1;
+    const pageSize = options.pageSize ?? 20;
+    const start = (page - 1) * pageSize;
+    const sanitizedQuery = query ? sanitizeSearchQuery(query) : '';
+    // Enough from each source that merging them can fill the requested page.
+    const candidateLimit = Math.min(start + pageSize, MAX_CANDIDATES_PER_SOURCE);
+    const withPreview = options.preview ?? false;
+
+    // One deadline for the whole search, not one per folder: what a caller
+    // cares about is when an answer arrives, and a per-folder timeout still
+    // adds up to minutes across three hundred of them.
+    let deadlineTimer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<'deadline'>((resolve) => {
+      deadlineTimer = setTimeout(() => resolve('deadline'), CROSS_FOLDER_DEADLINE_MS);
+      deadlineTimer.unref?.();
+    });
+
+    const collected: EmailMeta[] = [];
+    const incompleteSources: string[] = [];
+    const headersOnlyAccounts: string[] = [];
+    let matched = 0;
+    let capped = false;
+
+    try {
+      const perAccount = await Promise.all(
+        accountNames.map(async (accountName) => {
+          const client = await this.connections.getImapClient(accountName);
+          const { mailboxes, indexed } = await ImapService.searchableMailboxes(client);
+
+          // Fanning a body search across many folders on a server that does not
+          // index is what makes these searches unusable. Headers only there.
+          const includeBody = indexed || mailboxes.length === 1;
+          if (!includeBody) headersOnlyAccounts.push(accountName);
+
+          const plan = ImapService.asSearchPlan({
+            criteria: ImapService.buildSearchCriteria(sanitizedQuery, options, includeBody),
+            candidateLimit,
+            withPreview,
+          });
+
+          const search = async (mb: string) => {
+            const outcome = await Promise.race([
+              this.searchOneMailbox(accountName, mb, plan),
+              deadline,
+            ]);
+            return outcome === 'deadline' ? { source: `${accountName}/${mb}` } : outcome;
+          };
+          return Promise.allSettled(mailboxes.map(search));
+        }),
+      );
+
+      perAccount.flat().forEach((outcome) => {
+        // A folder that cannot be selected or searched drops out rather than
+        // failing the whole search.
+        if (outcome.status !== 'fulfilled') return;
+        if ('source' in outcome.value) {
+          incompleteSources.push(outcome.value.source);
+          return;
+        }
+        collected.push(...outcome.value.metas);
+        matched += outcome.value.matched;
+        capped ||= outcome.value.capped;
+      });
+    } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+    }
+
+    // The same message can sit in several folders — Gmail labels most of all.
+    const bySource = new Map<string, EmailMeta>();
+    collected.forEach((meta) => {
+      const key = `${meta.account}\u0000${meta.id}\u0000${meta.mailbox}`;
+      bySource.set(key, meta);
+    });
+
+    const merged = [...bySource.values()].sort(
+      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
+    );
+
+    return {
+      items: merged.slice(start, start + pageSize),
+      total: matched,
+      page,
+      pageSize,
+      hasMore: merged.length > start + pageSize || capped,
+      // Either the per-source cap or an unfinished source means the count is a
+      // floor, not a total.
+      ...(capped || incompleteSources.length > 0 ? { totalIsLowerBound: true } : {}),
+      ...(incompleteSources.length > 0 ? { incompleteSources } : {}),
+      ...(headersOnlyAccounts.length > 0 ? { bodyNotSearched: headersOnlyAccounts } : {}),
+    };
+  }
+
   async searchEmails(
     accountName: string,
     query: string,
@@ -833,32 +1120,7 @@ export default class ImapService {
 
     const lock = await client.getMailboxLock(mailbox);
     try {
-      // Build search criteria — base query OR across subject/from/body
-      const baseCriteria: Record<string, unknown> = sanitizedQuery
-        ? { or: [{ subject: sanitizedQuery }, { from: sanitizedQuery }, { body: sanitizedQuery }] }
-        : {};
-
-      // Build additional filters as AND conditions
-      const andConditions: Record<string, unknown>[] = [baseCriteria];
-
-      if (options.to) {
-        andConditions.push({ to: options.to });
-      }
-      if (options.largerThan !== undefined) {
-        andConditions.push({ larger: options.largerThan * 1024 });
-      }
-      if (options.smallerThan !== undefined) {
-        andConditions.push({ smaller: options.smallerThan * 1024 });
-      }
-      if (options.answered === true) {
-        andConditions.push({ answered: true });
-      } else if (options.answered === false) {
-        andConditions.push({ answered: false });
-      }
-
-      // Use the combined criteria or just the base
-      const searchCriteria =
-        andConditions.length === 1 ? baseCriteria : Object.assign({}, ...andConditions);
+      const searchCriteria = ImapService.buildSearchCriteria(sanitizedQuery, options);
 
       const searchResult = await client.search(searchCriteria, { uid: true });
       const uids: number[] = Array.isArray(searchResult) ? searchResult : [];

@@ -508,6 +508,7 @@ For single-account setups (overrides config file):
 | `MCP_EMAIL_IMAP_IDLE_PROBE_MS` | `60000` | Idle time after which a pooled IMAP connection is probed before reuse (`0` disables probing) |
 | `MCP_EMAIL_IMAP_PROBE_TIMEOUT_MS` | `5000` | How long that probe may take before the connection is rebuilt |
 | `MCP_EMAIL_IMAP_POOL_SIZE` | `3` | Most IMAP connections opened per account for concurrent work |
+| `MCP_EMAIL_SEARCH_DEADLINE_MS` | `15000` | Time budget for a search spanning several folders; unfinished folders are reported, not waited for |
 | `MCP_EMAIL_IMAP_DISABLE_COMPRESSION` | `false` | Set `true` to skip COMPRESS=DEFLATE (profiling and proxy traces) |
 
 ¹ One of `MCP_EMAIL_PASSWORD`, `MCP_EMAIL_PASSWORD_COMMAND`, or the OAuth2 variables is required.
@@ -533,6 +534,18 @@ That reaping is deliberate: a server shares an account's throughput across its
 connections, and holding spares open measurably slowed unrelated sequential
 work. Lower the setting to `1` for a server with a tight per-account connection
 limit; that restores the older, fully sequential behaviour.
+
+`MCP_EMAIL_SEARCH_DEADLINE_MS` bounds `search_emails` when `scope` is wider than
+one folder. How wide a search costs depends entirely on the server: one that
+indexes its mail answers whatever the folder count — Gmail returns in under a
+second across 147 labels, because a single All Mail search covers every one of
+them. A server without an index is linear in folders, and an account measured
+here with 309 folders took 77 seconds for the same query. Past the deadline the
+search returns what it has and names the folders it skipped, so a partial answer
+is never mistaken for a complete one. On such a server a wide search also looks
+at headers only, since scanning bodies costs about five times as much per
+folder; the result says so, and `scope: "mailbox"` still searches bodies in a
+named folder.
 
 `MCP_EMAIL_IMAP_DISABLE_COMPRESSION` exists for measurement. Compression is
 on by default and worth keeping: the only reason to turn it off is that the

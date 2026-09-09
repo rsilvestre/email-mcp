@@ -208,6 +208,13 @@ export interface EmailMeta {
   preview?: string;
   /** Set only for list or machine-generated mail; absent for personal mail. */
   bulk?: BulkSignal;
+  /**
+   * Where the message was found. Present only on results gathered from more
+   * than one place: a UID means nothing without the folder it belongs to, so a
+   * cross-folder result is unusable without these.
+   */
+  account?: string;
+  mailbox?: string;
 }
 
 export interface AttachmentMeta {
@@ -295,6 +302,25 @@ export interface PaginatedResult<T> {
    * unknown without scanning everything — which is the cost being avoided.
    */
   totalIsLowerBound?: boolean;
+  /**
+   * Sources that did not finish in time, as "account/folder".
+   *
+   * A search spanning many folders on a server with no full-text index can run
+   * for minutes. Rather than wait, it returns what arrived and names what did
+   * not, so the caller knows the answer is partial instead of assuming it is
+   * complete.
+   */
+  incompleteSources?: string[];
+  /**
+   * Accounts whose message bodies were not searched, only their headers.
+   *
+   * A server with no full-text index scans each message to answer a body
+   * search — measured here at 5.3x the cost of a header-only search, per
+   * folder. Across hundreds of folders that is the difference between a usable
+   * answer and none, so a wide search on such a server searches headers only
+   * and says which accounts that applied to.
+   */
+  bodyNotSearched?: string[];
 }
 
 // ---------------------------------------------------------------------------

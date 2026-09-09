@@ -1109,3 +1109,181 @@ describe('ImapService.getThread with server-side threading', () => {
     expect(searchCriteria).toHaveLength(4);
   });
 });
+
+// ---------------------------------------------------------------------------
+// searchAcross
+// ---------------------------------------------------------------------------
+
+describe('ImapService.searchAcross', () => {
+  let client: ReturnType<typeof createMockImapClient>;
+  let service: ImapService;
+  /** Folders selected, in order, and the criteria used against them. */
+  let visited: { mailbox: string; criteria: Record<string, unknown> }[];
+  let connections: ReturnType<typeof createMockConnectionManager>;
+
+  function gmailFolders() {
+    return [
+      { name: 'INBOX', path: 'INBOX', listed: true, flags: new Set<string>() },
+      {
+        name: 'Tous les messages',
+        path: '[Gmail]/Tous les messages',
+        listed: true,
+        flags: new Set<string>(),
+        specialUse: '\\All',
+      },
+      { name: 'Klakedelle', path: 'Klakedelle', listed: true, flags: new Set<string>() },
+    ];
+  }
+
+  function plainFolders() {
+    return [
+      { name: 'Archives', path: 'Archives', listed: true, flags: new Set<string>() },
+      { name: 'INBOX', path: 'INBOX', listed: true, flags: new Set<string>() },
+      { name: 'Spam', path: 'Spam', listed: true, flags: new Set<string>(), specialUse: '\\Junk' },
+      { name: 'Hidden', path: 'Hidden', listed: true, flags: new Set(['\\Noselect']) },
+    ];
+  }
+
+  /**
+   * Give every selected folder one matching message, dated by folder.
+   *
+   * Each pooled call gets its own client: folders are searched concurrently,
+   * and in production every connection carries its own selected mailbox. A
+   * single shared mock would let one folder's selection overwrite another's.
+   */
+  function respondPerFolder(datesByMailbox: Record<string, string>, unselectable: string[] = []) {
+    connections.withImapClient = async <T>(_a: string, task: (c: ImapFlow) => Promise<T>) => {
+      let current = '';
+      const perCall = {
+        capabilities: client.capabilities,
+        list: client.list,
+        getMailboxLock: async (mailbox: string) => {
+          if (unselectable.includes(mailbox)) throw new Error('NO [SERVERBUG] cannot select');
+          current = mailbox;
+          return { release: vi.fn() };
+        },
+        search: async (criteria: Record<string, unknown>) => {
+          visited.push({ mailbox: current, criteria });
+          return datesByMailbox[current] ? [10] : [];
+        },
+        fetch: () => {
+          const date = datesByMailbox[current] ?? '2026-01-01';
+          const mailbox = current;
+          async function* messages() {
+            yield {
+              uid: 10,
+              envelope: { date, subject: `depuis ${mailbox}`, from: [], to: [] },
+              flags: new Set<string>(),
+              bodyStructure: { type: 'text/plain' },
+            };
+          }
+          return messages();
+        },
+      };
+      return task(perCall as unknown as ImapFlow);
+    };
+  }
+
+  beforeEach(() => {
+    client = createMockImapClient();
+    connections = createMockConnectionManager(client);
+    service = new ImapService(connections);
+    visited = [];
+  });
+
+  it('searches only All Mail on a server that indexes it', async () => {
+    client.capabilities = new Set(['X-GM-EXT-1']);
+    client.list.mockResolvedValue(gmailFolders());
+    respondPerFolder({ '[Gmail]/Tous les messages': '2026-03-01' });
+
+    const result = await service.searchAcross(['test'], 'Klakedelle', { pageSize: 5 });
+
+    // All Mail holds every label, so one folder covers the account.
+    expect(visited.map((v) => v.mailbox)).toEqual(['[Gmail]/Tous les messages']);
+    expect(result.items).toHaveLength(1);
+    expect(result.bodyNotSearched).toBeUndefined();
+  });
+
+  it('searches message bodies where the server indexes them', async () => {
+    client.capabilities = new Set(['X-GM-EXT-1']);
+    client.list.mockResolvedValue(gmailFolders());
+    respondPerFolder({ '[Gmail]/Tous les messages': '2026-03-01' });
+
+    await service.searchAcross(['test'], 'Klakedelle', {});
+
+    const terms = (visited[0]?.criteria.or ?? []) as Record<string, string>[];
+    expect(terms.some((term) => 'body' in term)).toBe(true);
+  });
+
+  it('fans out over real folders when there is no All Mail', async () => {
+    client.capabilities = new Set<string>();
+    client.list.mockResolvedValue(plainFolders());
+    respondPerFolder({ INBOX: '2026-03-01', Archives: '2026-02-01' });
+
+    const result = await service.searchAcross(['test'], 'Klakedelle', { pageSize: 5 });
+
+    const searched = visited.map((v) => v.mailbox);
+    // Junk and \Noselect are left out; INBOX is searched before the rest so a
+    // search cut short by the deadline has looked where it matters.
+    expect(searched).toEqual(['INBOX', 'Archives']);
+    expect(result.items).toHaveLength(2);
+  });
+
+  it('leaves bodies out of a wide search on a server with no index', async () => {
+    client.capabilities = new Set<string>();
+    client.list.mockResolvedValue(plainFolders());
+    respondPerFolder({ INBOX: '2026-03-01' });
+
+    const result = await service.searchAcross(['test'], 'Klakedelle', {});
+
+    const terms = (visited[0]?.criteria.or ?? []) as Record<string, string>[];
+    expect(terms.some((term) => 'body' in term)).toBe(false);
+    // Silently narrowing the query would make an incomplete answer look whole.
+    expect(result.bodyNotSearched).toEqual(['test']);
+  });
+
+  it('tags every result with the account and folder it came from', async () => {
+    client.capabilities = new Set<string>();
+    client.list.mockResolvedValue(plainFolders());
+    respondPerFolder({ INBOX: '2026-03-01', Archives: '2026-02-01' });
+
+    const result = await service.searchAcross(['test'], 'Klakedelle', {});
+
+    // A UID means nothing without its folder — a caller could not act on these.
+    result.items.forEach((item) => {
+      expect(item.account).toBe('test');
+      expect(item.mailbox).toBeTruthy();
+    });
+  });
+
+  it('merges the folders newest first', async () => {
+    client.capabilities = new Set<string>();
+    client.list.mockResolvedValue(plainFolders());
+    respondPerFolder({ INBOX: '2026-01-15', Archives: '2026-06-30' });
+
+    const result = await service.searchAcross(['test'], 'Klakedelle', {});
+
+    expect(result.items.map((item) => item.mailbox)).toEqual(['Archives', 'INBOX']);
+  });
+
+  it('drops a folder it cannot search rather than failing the search', async () => {
+    client.capabilities = new Set<string>();
+    client.list.mockResolvedValue(plainFolders());
+    respondPerFolder({ INBOX: '2026-03-01', Archives: '2026-02-01' }, ['Archives']);
+
+    const result = await service.searchAcross(['test'], 'Klakedelle', {});
+
+    expect(result.items).toHaveLength(1);
+  });
+
+  it('resolves "all" to every configured account', async () => {
+    client.capabilities = new Set(['X-GM-EXT-1']);
+    client.list.mockResolvedValue(gmailFolders());
+    respondPerFolder({ '[Gmail]/Tous les messages': '2026-03-01' });
+
+    const result = await service.searchAcross('all', 'Klakedelle', {});
+
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.account).toBe('test');
+  });
+});
