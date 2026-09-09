@@ -325,19 +325,39 @@ async function runScenario(
     samples.push({ durationMs, wire });
   }
 
-  const sortedDurations = samples.map((s) => s.durationMs).sort((a, b) => a - b);
-  const medianSample = samples[Math.floor(samples.length / 2)];
+  // Each metric gets its own median. Taking them all from whichever run landed
+  // in the middle of the array would report one arbitrary run, not the typical
+  // value of each measurement.
+  const median = (values: number[]): number =>
+    percentile(
+      [...values].sort((a, b) => a - b),
+      0.5,
+    );
+
+  const durations = samples.map((sample) => sample.durationMs);
+  const commandCounts = samples.map((sample) => sample.wire.totalCommands);
+  const byteCounts = samples.map((sample) => sample.wire.bytesRead);
+
+  // The command breakdown has to come from one run to stay self-consistent;
+  // pick the run whose command count is the median.
+  const representative =
+    samples.find((sample) => sample.wire.totalCommands === median(commandCounts)) ?? samples[0];
 
   return {
     account: accountName,
     scenario: scenario.name,
     targets: scenario.targets,
-    medianDurationMs: Math.round(percentile(sortedDurations, 0.5)),
-    p90DurationMs: Math.round(percentile(sortedDurations, 0.9)),
-    commands: medianSample?.wire.totalCommands ?? 0,
-    bytesRead: medianSample?.wire.bytesRead ?? 0,
-    commandsByName: medianSample?.wire.commandsByName ?? {},
-    reconnects: Math.max(0, (medianSample?.wire.socketCount ?? 1) - 1),
+    medianDurationMs: Math.round(median(durations)),
+    p90DurationMs: Math.round(
+      percentile(
+        [...durations].sort((a, b) => a - b),
+        0.9,
+      ),
+    ),
+    commands: Math.round(median(commandCounts)),
+    bytesRead: Math.round(median(byteCounts)),
+    commandsByName: representative?.wire.commandsByName ?? {},
+    reconnects: Math.max(0, (representative?.wire.socketCount ?? 1) - 1),
     error: failure,
   };
 }
@@ -404,6 +424,17 @@ async function main(): Promise<void> {
   const { accounts, runs, label } = parseArgs();
 
   const config = await loadConfig();
+  // Compression is negotiated per connection; ConnectionManager read the flag
+  // when this module's imports were evaluated, and parseArgs sets nothing here,
+  // so the caller must export MCP_EMAIL_IMAP_DISABLE_COMPRESSION=true. The
+  // pnpm bench script does that — warn if something else invoked us.
+  if (process.env.MCP_EMAIL_IMAP_DISABLE_COMPRESSION !== 'true') {
+    process.stderr.write(
+      'Attention : COMPRESS=DEFLATE est actif. Les octets mesurés sont compressés ' +
+        "et le dictionnaire deflate reste chaud d'un run à l'autre, ce qui rend la " +
+        'colonne « octets lus » inexploitable. Lancez via `pnpm bench`.\n',
+    );
+  }
   const connectionManager = new ConnectionManager(config.accounts, new OAuthService());
   const instrumented = new InstrumentedConnectionManager(connectionManager);
   const imapService = new ImapService(instrumented);

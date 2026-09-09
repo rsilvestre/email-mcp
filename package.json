@@ -18,7 +18,7 @@
     "start": "node dist/main.js",
     "typecheck": "tsc --noEmit",
     "typecheck:bench": "tsc -p tsconfig.bench.json",
-    "bench": "tsx scripts/bench/imap-bench.ts",
+    "bench": "MCP_EMAIL_IMAP_DISABLE_COMPRESSION=true tsx scripts/bench/imap-bench.ts",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "format": "biome format --write src/",

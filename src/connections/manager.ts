@@ -37,6 +37,17 @@ const IDLE_BEFORE_PROBE_MS = Number(process.env.MCP_EMAIL_IMAP_IDLE_PROBE_MS ?? 
 /** How long the liveness probe itself may take before the connection is rebuilt. */
 const PROBE_TIMEOUT_MS = Number(process.env.MCP_EMAIL_IMAP_PROBE_TIMEOUT_MS ?? 5_000);
 
+/**
+ * Opt out of COMPRESS=DEFLATE.
+ *
+ * Compression is on by default and worth having. It does make transferred
+ * bytes unmeasurable from outside, though: the deflate stream keeps its
+ * dictionary for the life of the connection, so repeating a request costs
+ * almost nothing on the wire regardless of payload size. Turn it off to see
+ * real payload sizes when profiling or reading a proxy trace.
+ */
+const DISABLE_COMPRESSION = process.env.MCP_EMAIL_IMAP_DISABLE_COMPRESSION === 'true';
+
 export default class ConnectionManager implements IConnectionManager {
   private imapClients = new Map<string, ImapFlow>();
 
@@ -212,6 +223,7 @@ export default class ConnectionManager implements IConnectionManager {
       },
       auth,
       logger: false,
+      disableCompression: DISABLE_COMPRESSION,
     });
 
     this.registerImapLifecycle(accountName, client);

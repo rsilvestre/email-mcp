@@ -29,6 +29,15 @@ underlying TLS socket's cumulative `bytesRead` / `bytesWritten`, accumulated per
 socket so a mid-run reconnect neither loses nor double-counts a delta — the
 report flags any scenario where the connection was rebuilt mid-measurement.
 
+**`pnpm bench` runs with COMPRESS=DEFLATE disabled**, and this is not optional
+for the byte column to mean anything. Gmail negotiates compression, and the
+deflate stream keeps its dictionary for the whole connection: repeating a
+request then costs a hundred-odd bytes on the wire regardless of payload size.
+Measured with compression on, a scenario that genuinely stopped downloading
+3 MB of attachments and one that merely repeated itself look identical, and an
+improvement reads as four orders of magnitude larger than it is. Run the bench
+any other way and it warns.
+
 Only the command *name* is recorded, never its arguments: search terms,
 Message-IDs and mailbox names would otherwise end up in a report file.
 
