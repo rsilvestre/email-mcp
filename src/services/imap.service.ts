@@ -244,6 +244,76 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
  * server then refuses, and a message with an unreadable body is still worth
  * returning with its headers intact.
  */
+/** UIDs examined per round when a filter has to be applied client-side. */
+const ATTACHMENT_FILTER_BATCH = 200;
+
+interface FilteredPage {
+  pageUids: number[];
+  /** Matches confirmed so far — a lower bound unless the scan ran to the end. */
+  total: number;
+  hasMore: boolean;
+  totalIsLowerBound: boolean;
+}
+
+/**
+ * Page through a UID set under the hasAttachment filter.
+ *
+ * IMAP cannot search on the presence of an attachment, so the structure of
+ * each candidate has to be fetched and inspected. Doing that for the entire
+ * match set before paginating meant a BODYSTRUCTURE fetch of the whole mailbox
+ * to return twenty rows.
+ *
+ * Instead the sorted UIDs are examined in batches and the scan stops once the
+ * page is full. The cost of `total` is what changes: it now counts only what
+ * was examined, and the caller is told so rather than being handed a number
+ * that looks exact.
+ */
+async function selectPageWithAttachmentFilter(
+  client: ImapFlow,
+  sortedUids: number[],
+  wantsAttachment: boolean,
+  skipCount: number,
+  pageSize: number,
+): Promise<FilteredPage> {
+  // One past the page tells us whether anything follows it.
+  const needed = skipCount + pageSize + 1;
+  const matches: number[] = [];
+  let examinedAll = true;
+
+  for (let offset = 0; offset < sortedUids.length; offset += ATTACHMENT_FILTER_BATCH) {
+    if (matches.length >= needed) {
+      examinedAll = false;
+      break;
+    }
+
+    const batch = sortedUids.slice(offset, offset + ATTACHMENT_FILTER_BATCH);
+    const structureByUid = new Map<number, unknown>();
+    // eslint-disable-next-line no-restricted-syntax, no-await-in-loop
+    for await (const msg of client.fetch(
+      batch.join(','),
+      { uid: true, bodyStructure: true },
+      { uid: true },
+    )) {
+      const raw = msg as unknown as Record<string, unknown>;
+      structureByUid.set(raw.uid as number, raw.bodyStructure);
+    }
+
+    // Iterate the batch, not the fetch, so ordering is the sorted one.
+    batch.forEach((uid) => {
+      if (hasAttachments(structureByUid.get(uid)) === wantsAttachment) {
+        matches.push(uid);
+      }
+    });
+  }
+
+  return {
+    pageUids: matches.slice(skipCount, skipCount + pageSize),
+    total: matches.length,
+    hasMore: matches.length > skipCount + pageSize,
+    totalIsLowerBound: !examinedAll,
+  };
+}
+
 async function downloadTextPart(
   client: ImapFlow,
   uid: number,
@@ -442,24 +512,7 @@ export default class ImapService {
 
       // Search for matching UIDs
       const searchResult = await client.search(search, { uid: true });
-      let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
-
-      // Post-filter for hasAttachment (IMAP has no native attachment search)
-      if (options.hasAttachment !== undefined && uids.length > 0) {
-        const filteredUids: number[] = [];
-        // eslint-disable-next-line no-restricted-syntax
-        for await (const msg of client.fetch(
-          uids.join(','),
-          { uid: true, bodyStructure: true },
-          { uid: true },
-        )) {
-          const raw = msg as unknown as Record<string, unknown>;
-          if (options.hasAttachment === hasAttachments(raw.bodyStructure)) {
-            filteredUids.push(raw.uid as number);
-          }
-        }
-        uids = filteredUids;
-      }
+      const uids: number[] = Array.isArray(searchResult) ? searchResult : [];
 
       if (uids.length === 0) {
         return {
@@ -471,11 +524,32 @@ export default class ImapService {
         };
       }
 
-      // Sort descending (newest first) and paginate
+      // Sort descending (newest first), then paginate.
       uids.sort((a, b) => b - a);
-      const total = uids.length;
       const start = (page - 1) * pageSize;
-      const pageUids = uids.slice(start, start + pageSize);
+
+      // hasAttachment has no IMAP equivalent, so it is resolved by inspecting
+      // message structure in batches until the page is full — rather than
+      // fetching BODYSTRUCTURE for every match before slicing twenty rows out.
+      const {
+        pageUids,
+        total,
+        hasMore: moreAfterPage,
+        totalIsLowerBound,
+      } = options.hasAttachment === undefined
+        ? {
+            pageUids: uids.slice(start, start + pageSize),
+            total: uids.length,
+            hasMore: start + pageSize < uids.length,
+            totalIsLowerBound: false,
+          }
+        : await selectPageWithAttachmentFilter(
+            client,
+            uids,
+            options.hasAttachment,
+            start,
+            pageSize,
+          );
 
       if (pageUids.length === 0) {
         return {
@@ -484,6 +558,7 @@ export default class ImapService {
           page,
           pageSize,
           hasMore: false,
+          ...(totalIsLowerBound ? { totalIsLowerBound } : {}),
         };
       }
 
@@ -525,7 +600,8 @@ export default class ImapService {
         total,
         page,
         pageSize,
-        hasMore: start + pageSize < total,
+        hasMore: moreAfterPage,
+        ...(totalIsLowerBound ? { totalIsLowerBound } : {}),
       };
     } finally {
       lock.release();
@@ -735,28 +811,7 @@ export default class ImapService {
         andConditions.length === 1 ? baseCriteria : Object.assign({}, ...andConditions);
 
       const searchResult = await client.search(searchCriteria, { uid: true });
-      let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
-
-      // Post-filter for has_attachment if requested (IMAP doesn't have native support)
-      if (options.hasAttachment !== undefined && uids.length > 0) {
-        const filteredUids: number[] = [];
-        const checkRange = uids.join(',');
-
-        // eslint-disable-next-line no-restricted-syntax
-        for await (const msg of client.fetch(
-          checkRange,
-          { uid: true, bodyStructure: true },
-          { uid: true },
-        )) {
-          const raw = msg as unknown as Record<string, unknown>;
-          const msgHasAtt = hasAttachments(raw.bodyStructure);
-          if (options.hasAttachment === msgHasAtt) {
-            filteredUids.push(raw.uid as number);
-          }
-        }
-
-        uids = filteredUids;
-      }
+      const uids: number[] = Array.isArray(searchResult) ? searchResult : [];
 
       if (uids.length === 0) {
         return {
@@ -769,9 +824,28 @@ export default class ImapService {
       }
 
       uids.sort((a, b) => b - a);
-      const total = uids.length;
       const start = (page - 1) * pageSize;
-      const pageUids = uids.slice(start, start + pageSize);
+
+      // has_attachment has no IMAP equivalent; see selectPageWithAttachmentFilter.
+      const {
+        pageUids,
+        total,
+        hasMore: moreAfterPage,
+        totalIsLowerBound,
+      } = options.hasAttachment === undefined
+        ? {
+            pageUids: uids.slice(start, start + pageSize),
+            total: uids.length,
+            hasMore: start + pageSize < uids.length,
+            totalIsLowerBound: false,
+          }
+        : await selectPageWithAttachmentFilter(
+            client,
+            uids,
+            options.hasAttachment,
+            start,
+            pageSize,
+          );
 
       if (pageUids.length === 0) {
         return {
@@ -780,6 +854,7 @@ export default class ImapService {
           page,
           pageSize,
           hasMore: false,
+          ...(totalIsLowerBound ? { totalIsLowerBound } : {}),
         };
       }
 
@@ -820,7 +895,8 @@ export default class ImapService {
         total,
         page,
         pageSize,
-        hasMore: start + pageSize < total,
+        hasMore: moreAfterPage,
+        ...(totalIsLowerBound ? { totalIsLowerBound } : {}),
       };
     } finally {
       lock.release();

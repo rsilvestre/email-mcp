@@ -288,6 +288,13 @@ export interface PaginatedResult<T> {
   page: number;
   pageSize: number;
   hasMore: boolean;
+  /**
+   * Set when `total` counts only what has been examined so far, not the whole
+   * match set. Filters IMAP cannot express server-side are applied by fetching
+   * message structure in batches until the page is full, so the true total is
+   * unknown without scanning everything — which is the cost being avoided.
+   */
+  totalIsLowerBound?: boolean;
 }
 
 // ---------------------------------------------------------------------------

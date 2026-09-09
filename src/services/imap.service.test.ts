@@ -585,3 +585,154 @@ describe('ImapService.findEmailFolder', () => {
     expect(result.folders).toEqual(['Klakedelle']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// hasAttachment filtering
+// ---------------------------------------------------------------------------
+
+describe('ImapService hasAttachment filtering', () => {
+  let client: ReturnType<typeof createMockImapClient>;
+  let service: ImapService;
+
+  /** A bodyStructure that does or does not carry an attachment. */
+  function structureFor(uid: number, withAttachment: boolean) {
+    return withAttachment
+      ? {
+          type: 'multipart/mixed',
+          childNodes: [
+            { part: '1', type: 'text/plain' },
+            { part: '2', type: 'application/pdf', disposition: 'attachment' },
+          ],
+        }
+      : { type: 'text/plain', part: String(uid) };
+  }
+
+  /**
+   * A mailbox of `size` messages where every `everyNth` message has an
+   * attachment, recording which UID ranges the service asked about.
+   */
+  function mailboxOf(size: number, everyNth: number) {
+    const uids = Array.from({ length: size }, (_, index) => index + 1);
+    const fetchedRanges: string[] = [];
+
+    client.search.mockResolvedValue(uids);
+    client.fetch.mockImplementation((range: string, options: Record<string, unknown>) => {
+      const requested = range.split(',').map(Number);
+      // Only the structure probe is of interest; the page fetch asks for
+      // envelopes too and is left alone.
+      async function* structures() {
+        for (const uid of requested) {
+          yield { uid, bodyStructure: structureFor(uid, uid % everyNth === 0) };
+        }
+      }
+      async function* page() {
+        for (const uid of requested) {
+          yield {
+            uid,
+            envelope: { date: new Date('2026-01-01').toISOString(), from: [], to: [] },
+            flags: new Set<string>(),
+            bodyStructure: structureFor(uid, uid % everyNth === 0),
+          };
+        }
+      }
+      if (options.bodyStructure === true && options.envelope === undefined) {
+        fetchedRanges.push(range);
+        return structures();
+      }
+      return page();
+    });
+
+    return { fetchedRanges };
+  }
+
+  beforeEach(() => {
+    client = createMockImapClient();
+    service = new ImapService(createMockConnectionManager(client));
+  });
+
+  it('inspects only enough messages to fill the page', async () => {
+    // 2000 messages, every 2nd carries an attachment: one 200-UID batch already
+    // yields 100 matches, far more than a 20-row page needs.
+    const { fetchedRanges } = mailboxOf(2000, 2);
+
+    const result = await service.listEmails('test', { hasAttachment: true, pageSize: 20 });
+
+    expect(result.items).toHaveLength(20);
+    // Previously this fetched BODYSTRUCTURE for all 2000 UIDs before slicing.
+    expect(fetchedRanges).toHaveLength(1);
+    expect(fetchedRanges[0]?.split(',')).toHaveLength(200);
+  });
+
+  it('marks the total as a lower bound when it stopped early', async () => {
+    mailboxOf(2000, 2);
+
+    const result = await service.listEmails('test', { hasAttachment: true, pageSize: 20 });
+
+    expect(result.totalIsLowerBound).toBe(true);
+    expect(result.hasMore).toBe(true);
+  });
+
+  it('reports an exact total when the whole set was examined', async () => {
+    // 50 messages, every 5th has an attachment: 10 matches, all found in the
+    // first batch, so nothing is left unexamined.
+    mailboxOf(50, 5);
+
+    const result = await service.listEmails('test', { hasAttachment: true, pageSize: 20 });
+
+    expect(result.total).toBe(10);
+    expect(result.totalIsLowerBound).toBeUndefined();
+    expect(result.hasMore).toBe(false);
+  });
+
+  it('keeps scanning across batches to reach a later page', async () => {
+    // Attachments are rare, so one batch cannot fill page 2.
+    const { fetchedRanges } = mailboxOf(600, 20);
+
+    const result = await service.listEmails('test', {
+      hasAttachment: true,
+      page: 2,
+      pageSize: 5,
+    });
+
+    expect(fetchedRanges.length).toBeGreaterThan(1);
+    expect(result.items).toHaveLength(5);
+  });
+
+  it('returns newest first', async () => {
+    mailboxOf(400, 2);
+
+    const result = await service.listEmails('test', { hasAttachment: true, pageSize: 5 });
+
+    const returnedUids = result.items.map((item) => Number(item.id));
+    expect(returnedUids).toEqual([...returnedUids].sort((a, b) => b - a));
+  });
+
+  it('finds messages without attachments when asked for the inverse', async () => {
+    mailboxOf(400, 2);
+
+    const result = await service.listEmails('test', { hasAttachment: false, pageSize: 5 });
+
+    expect(result.items).toHaveLength(5);
+    expect(result.items.every((item) => !item.hasAttachments)).toBe(true);
+  });
+
+  it('does not probe structure at all without the filter', async () => {
+    const { fetchedRanges } = mailboxOf(400, 2);
+
+    await service.listEmails('test', { pageSize: 20 });
+
+    expect(fetchedRanges).toHaveLength(0);
+  });
+
+  it('applies the same batching to search_emails', async () => {
+    const { fetchedRanges } = mailboxOf(2000, 2);
+
+    const result = await service.searchEmails('test', 'facture', {
+      hasAttachment: true,
+      pageSize: 20,
+    });
+
+    expect(fetchedRanges).toHaveLength(1);
+    expect(result.items).toHaveLength(20);
+  });
+});

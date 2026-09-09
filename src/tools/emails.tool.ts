@@ -70,6 +70,26 @@ function stripReplyChain(text: string): string {
     .trim();
 }
 
+/**
+ * Render a result count.
+ *
+ * A filter IMAP cannot express is resolved by inspecting messages until the
+ * page is full, so the count reflects what was examined rather than the whole
+ * match set. Printing that as an exact number would be a plain lie, and so
+ * would the page count derived from it.
+ */
+function formatResultCount(result: {
+  total: number;
+  page: number;
+  pageSize: number;
+  totalIsLowerBound?: boolean;
+}): string {
+  const pageCount = Math.max(1, Math.ceil(result.total / result.pageSize));
+  return result.totalIsLowerBound
+    ? `${result.total}+ (page ${result.page})`
+    : `${result.total} (page ${result.page}/${pageCount})`;
+}
+
 type BodyFormat = 'full' | 'text' | 'stripped';
 
 /**
@@ -173,8 +193,7 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
         }
 
         const header =
-          `📬 [${params.mailbox}] ${result.total} emails ` +
-          `(page ${result.page}/${Math.ceil(result.total / result.pageSize)})` +
+          `📬 [${params.mailbox}] ${formatResultCount(result)} emails` +
           `${result.hasMore ? ' — more pages available' : ''}\n`;
         const emails = result.items.map(formatEmailMeta).join('\n\n');
 
@@ -552,8 +571,8 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
 
         const queryLabel = params.query ? `"${params.query}"` : 'filters';
         const header =
-          `🔍 [${params.mailbox}] ${result.total} result(s) for ${queryLabel} ` +
-          `(page ${result.page}/${Math.ceil(result.total / result.pageSize)})\n`;
+          `🔍 [${params.mailbox}] ${formatResultCount(result)} result(s) for ${queryLabel}` +
+          `${result.hasMore ? ' — more pages available' : ''}\n`;
         const emails = result.items.map(formatEmailMeta).join('\n\n');
 
         return {
