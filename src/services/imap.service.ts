@@ -245,8 +245,21 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
  * server then refuses, and a message with an unreadable body is still worth
  * returning with its headers intact.
  */
-/** UIDs examined per round when a filter has to be applied client-side. */
-const ATTACHMENT_FILTER_BATCH = 200;
+/**
+ * First batch of UIDs examined when a filter has to be applied client-side.
+ *
+ * Batches grow geometrically from here. A fixed size gets the dense case right
+ * and the sparse case wrong: where matches are rare, filling one page of twenty
+ * took eight round trips, which measured slower than the whole-set fetch it
+ * replaced even though it moved fewer bytes.
+ */
+const ATTACHMENT_FILTER_FIRST_BATCH = 250;
+
+/** How much larger each subsequent batch is, once the first proves too small. */
+const ATTACHMENT_FILTER_GROWTH = 4;
+
+/** Ceiling on a single batch, so one fetch cannot name an unbounded UID list. */
+const ATTACHMENT_FILTER_MAX_BATCH = 4000;
 
 interface FilteredPage {
   pageUids: number[];
@@ -280,14 +293,21 @@ async function selectPageWithAttachmentFilter(
   const needed = skipCount + pageSize + 1;
   const matches: number[] = [];
   let examinedAll = true;
+  let batchSize = ATTACHMENT_FILTER_FIRST_BATCH;
+  let offset = 0;
 
-  for (let offset = 0; offset < sortedUids.length; offset += ATTACHMENT_FILTER_BATCH) {
+  while (offset < sortedUids.length) {
     if (matches.length >= needed) {
       examinedAll = false;
       break;
     }
 
-    const batch = sortedUids.slice(offset, offset + ATTACHMENT_FILTER_BATCH);
+    const batch = sortedUids.slice(offset, offset + batchSize);
+    // Advance by what this batch actually covered, then widen the next look.
+    // Growing before advancing would step over the UIDs in between and drop
+    // them from the results entirely.
+    offset += batch.length;
+    batchSize = Math.min(batchSize * ATTACHMENT_FILTER_GROWTH, ATTACHMENT_FILTER_MAX_BATCH);
     const structureByUid = new Map<number, unknown>();
     // eslint-disable-next-line no-restricted-syntax, no-await-in-loop
     for await (const msg of client.fetch(

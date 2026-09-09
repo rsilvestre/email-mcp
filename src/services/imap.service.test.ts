@@ -651,8 +651,8 @@ describe('ImapService hasAttachment filtering', () => {
   });
 
   it('inspects only enough messages to fill the page', async () => {
-    // 2000 messages, every 2nd carries an attachment: one 200-UID batch already
-    // yields 100 matches, far more than a 20-row page needs.
+    // 2000 messages, every 2nd carries an attachment: the first batch already
+    // yields far more matches than a 20-row page needs.
     const { fetchedRanges } = mailboxOf(2000, 2);
 
     const result = await service.listEmails('test', { hasAttachment: true, pageSize: 20 });
@@ -660,7 +660,33 @@ describe('ImapService hasAttachment filtering', () => {
     expect(result.items).toHaveLength(20);
     // Previously this fetched BODYSTRUCTURE for all 2000 UIDs before slicing.
     expect(fetchedRanges).toHaveLength(1);
-    expect(fetchedRanges[0]?.split(',')).toHaveLength(200);
+    expect(fetchedRanges[0]?.split(',')).toHaveLength(250);
+  });
+
+  // Fixed-size batches got this case wrong: with matches rare, filling one page
+  // took eight round trips and measured slower than the whole-set fetch it
+  // replaced, despite moving fewer bytes.
+  it('widens the scan quickly when matches are rare', async () => {
+    // 20000 messages, 1 in 500 with an attachment: filling a 20-row page means
+    // examining roughly 10500 of them.
+    const { fetchedRanges } = mailboxOf(20000, 500);
+
+    const result = await service.listEmails('test', { hasAttachment: true, pageSize: 20 });
+
+    expect(result.items).toHaveLength(20);
+    // Geometric growth reaches that depth in a handful of commands. At a fixed
+    // 250 per batch it would have taken more than forty.
+    expect(fetchedRanges.length).toBeLessThanOrEqual(6);
+    expect(fetchedRanges.length).toBeLessThan(20000 / 500 / 2);
+  });
+
+  it('never asks about more UIDs than the cap in one command', async () => {
+    const { fetchedRanges } = mailboxOf(60000, 10000);
+
+    await service.listEmails('test', { hasAttachment: true, pageSize: 20 });
+
+    const largestBatch = Math.max(...fetchedRanges.map((range) => range.split(',').length));
+    expect(largestBatch).toBeLessThanOrEqual(4000);
   });
 
   it('marks the total as a lower bound when it stopped early', async () => {
@@ -685,12 +711,12 @@ describe('ImapService hasAttachment filtering', () => {
   });
 
   it('keeps scanning across batches to reach a later page', async () => {
-    // Attachments are rare, so one batch cannot fill page 2.
-    const { fetchedRanges } = mailboxOf(600, 20);
+    // 1 in 100 carries an attachment, so the first batch cannot reach page 3.
+    const { fetchedRanges } = mailboxOf(3000, 100);
 
     const result = await service.listEmails('test', {
       hasAttachment: true,
-      page: 2,
+      page: 3,
       pageSize: 5,
     });
 
@@ -734,6 +760,33 @@ describe('ImapService hasAttachment filtering', () => {
 
     expect(fetchedRanges).toHaveLength(1);
     expect(result.items).toHaveLength(20);
+  });
+
+  // A geometric batch size makes it easy to advance the cursor by the *next*
+  // size rather than the one just used, stepping over UIDs in between. That
+  // dropped real messages from results while still looking plausible.
+  it('examines every UID when it scans to the end', async () => {
+    const { fetchedRanges } = mailboxOf(3000, 100);
+
+    await service.listEmails('test', { hasAttachment: true, page: 6, pageSize: 5 });
+
+    const examined = fetchedRanges.flatMap((range) => range.split(',').map(Number));
+    expect(new Set(examined).size).toBe(examined.length);
+    expect(examined).toHaveLength(3000);
+  });
+
+  it('still walks the whole set when it must, without a fetch per message', async () => {
+    // No message has an attachment: every UID has to be examined, and the
+    // answer is an honest empty page rather than a partial one.
+    const { fetchedRanges } = mailboxOf(5000, 999999);
+
+    const result = await service.listEmails('test', { hasAttachment: true, pageSize: 20 });
+
+    expect(result.items).toEqual([]);
+    expect(result.total).toBe(0);
+    expect(result.totalIsLowerBound).toBeUndefined();
+    // Geometric growth: a handful of commands, not one per message.
+    expect(fetchedRanges.length).toBeLessThanOrEqual(6);
   });
 });
 
