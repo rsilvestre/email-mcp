@@ -328,3 +328,8 @@ $RECYCLE.BIN/
 
 # End of https://www.toptal.com/developers/gitignore/api/linux,windows,macos,node,visualstudiocode,jetbrains+all
 .mcpregistry_*
+
+# Benchmark run artefacts — these reference real mailboxes (UIDs, Message-IDs,
+# folder names) from whoever ran the bench, so they stay local.
+scripts/bench/fixtures.json
+scripts/bench/results/

@@ -15,14 +15,41 @@ import { mcpLog } from '../logging.js';
 import type OAuthService from '../services/oauth.service.js';
 import type { AccountConfig } from '../types/index.js';
 import buildImapAuth from './auth.js';
+import PooledImapConnection from './pooled-connection.js';
 import type { IConnectionManager } from './types.js';
 
 type SmtpAuth =
   | { user: string; pass?: string }
   | { type: string; user: string; accessToken: string };
 
+/** How long the liveness probe itself may take before the connection is rebuilt. */
+const PROBE_TIMEOUT_MS = Number(process.env.MCP_EMAIL_IMAP_PROBE_TIMEOUT_MS ?? 5_000);
+
+/**
+ * Opt out of COMPRESS=DEFLATE.
+ *
+ * Compression is on by default and worth having. It does make transferred
+ * bytes unmeasurable from outside, though: the deflate stream keeps its
+ * dictionary for the life of the connection, so repeating a request costs
+ * almost nothing on the wire regardless of payload size. Turn it off to see
+ * real payload sizes when profiling or reading a proxy trace.
+ */
+const DISABLE_COMPRESSION = process.env.MCP_EMAIL_IMAP_DISABLE_COMPRESSION === 'true';
+
+/**
+ * Most IMAP connections opened for one account.
+ *
+ * imapflow serialises commands on a connection and getMailboxLock serialises on
+ * top of that, so every Promise.all over IMAP work runs single file on one
+ * socket. Extra connections are opened only when work is actually waiting, and
+ * never for sequential use. Servers cap simultaneous connections per account
+ * (Gmail allows 15), so this stays small.
+ */
+const POOL_MAX_DEFAULT = Math.max(1, Number(process.env.MCP_EMAIL_IMAP_POOL_SIZE ?? 3));
+
 export default class ConnectionManager implements IConnectionManager {
-  private imapClients = new Map<string, ImapFlow>();
+  /** Connections per account, each possibly still opening. */
+  private imapPools = new Map<string, PooledImapConnection[]>();
 
   private smtpTransports = new Map<string, Transporter>();
 
@@ -59,15 +86,29 @@ export default class ConnectionManager implements IConnectionManager {
   // IMAP
   // -------------------------------------------------------------------------
 
-  private registerImapLifecycle(accountName: string, client: ImapFlow): void {
-    const invalidateIfCurrent = () => {
-      if (this.imapClients.get(accountName) === client) {
-        this.imapClients.delete(accountName);
-      }
+  /** Take a connection out of its account's pool, if it is still there. */
+  private removeFromPool(accountName: string, entry: PooledImapConnection): void {
+    const pool = this.imapPools.get(accountName);
+    if (!pool) return;
+    const index = pool.indexOf(entry);
+    if (index !== -1) pool.splice(index, 1);
+    if (pool.length === 0) this.imapPools.delete(accountName);
+  }
+
+  /** Drop a connection from its pool once the socket reports it is gone. */
+  private registerImapLifecycle(
+    accountName: string,
+    client: ImapFlow,
+    entry: PooledImapConnection,
+  ): void {
+    // Guarded on identity: a late error from a replaced connection must not
+    // evict the one that took its place.
+    const removeIfCurrent = () => {
+      this.removeFromPool(accountName, entry);
     };
 
     client.on('error', (err) => {
-      invalidateIfCurrent();
+      removeIfCurrent();
       mcpLog(
         'error',
         'imap',
@@ -75,25 +116,233 @@ export default class ConnectionManager implements IConnectionManager {
       ).catch(() => undefined);
     });
 
-    client.on('close', invalidateIfCurrent);
+    client.on('close', removeIfCurrent);
   }
 
-  async getImapClient(accountName: string): Promise<ImapFlow> {
-    const existing = this.imapClients.get(accountName);
-    if (existing?.usable) {
-      return existing;
+  /**
+   * Confirm a connection still answers, within a bounded time.
+   *
+   * NOOP is the cheapest command that proves the round trip works. The race is
+   * what makes this worth doing: a dead socket typically does not reject, it
+   * simply never answers, so waiting on the NOOP alone would reproduce the very
+   * stall this is meant to avoid.
+   */
+  private static async respondsToProbe(client: ImapFlow): Promise<boolean> {
+    let probeTimer: NodeJS.Timeout | undefined;
+    try {
+      const timedOut = new Promise<false>((resolve) => {
+        probeTimer = setTimeout(() => resolve(false), PROBE_TIMEOUT_MS);
+        probeTimer.unref?.();
+      });
+      return await Promise.race([client.noop().then(() => true), timedOut]);
+    } catch {
+      return false;
+    } finally {
+      if (probeTimer) clearTimeout(probeTimer);
+    }
+  }
+
+  /**
+   * Reserve a pool slot and start connecting into it.
+   *
+   * The entry is pushed before the first await so that callers dispatched in
+   * the same tick see the pool growing. Waiting until the socket was up would
+   * make every one of them observe an empty pool and pile onto one connection.
+   */
+  private addImapConnection(accountName: string): PooledImapConnection {
+    const pool = this.imapPools.get(accountName) ?? [];
+    if (!this.imapPools.has(accountName)) this.imapPools.set(accountName, pool);
+
+    const entry = new PooledImapConnection();
+    pool.push(entry);
+
+    entry.startOpening(async () => this.openImapClientOrReleaseSlot(accountName, entry));
+
+    return entry;
+  }
+
+  /**
+   * Pick the connection to run work on.
+   *
+   * `allowGrowth` separates the two kinds of caller. withImapClient knows when
+   * its work finishes and so can justify another socket; getImapClient hands
+   * out a connection with no idea how long it will be used, and opening one per
+   * sequential call would be pure cost.
+   */
+  /**
+   * Close spare connections that have gone quiet.
+   *
+   * Extra sockets are not free once the burst that needed them is over: a
+   * server shares an account's throughput across its connections, and holding
+   * three open measurably slowed a byte-heavy sequential listing on Gmail — 30%
+   * on a path that never used the pool at all. Reaping brings the steady state
+   * back to one connection, so only genuinely concurrent work pays for the
+   * extras. The first connection is kept; it is the one everything else uses.
+   */
+  private reapIdleSpareConnections(accountName: string): void {
+    const pool = this.imapPools.get(accountName);
+    if (!pool || pool.length <= 1) return;
+
+    // Walk backwards: splicing while iterating forwards skips entries.
+    for (let index = pool.length - 1; index >= 1; index -= 1) {
+      const entry = pool[index];
+      if (entry?.inFlight === 0 && entry.isStale()) {
+        pool.splice(index, 1);
+        // Best-effort: a spare that fails to log out is being discarded anyway.
+        entry.ready
+          .then(async (client) => client.logout())
+          .catch(() => undefined)
+          .then(() => undefined);
+      }
+    }
+  }
+
+  /**
+   * How many connections this account may open.
+   *
+   * Per-account because the right number depends on the server: one that
+   * indexes its mail answers a wide search in a single command, while one that
+   * does not is searched folder by folder and gets through them roughly in
+   * proportion to the connections allowed.
+   */
+  private poolLimitFor(accountName: string): number {
+    const configured = this.accounts.get(accountName)?.imapPoolSize;
+    return configured ? Math.max(1, configured) : POOL_MAX_DEFAULT;
+  }
+
+  private selectImapConnection(accountName: string, allowGrowth: boolean): PooledImapConnection {
+    this.reapIdleSpareConnections(accountName);
+
+    const pool = this.imapPools.get(accountName) ?? [];
+    const leastLoaded = pool.reduce<PooledImapConnection | undefined>(
+      (best, entry) => (best === undefined || entry.inFlight < best.inFlight ? entry : best),
+      undefined,
+    );
+
+    if (leastLoaded === undefined) {
+      return this.addImapConnection(accountName);
+    }
+    if (allowGrowth && leastLoaded.inFlight > 0 && pool.length < this.poolLimitFor(accountName)) {
+      return this.addImapConnection(accountName);
+    }
+    return leastLoaded;
+  }
+
+  /**
+   * Await a slot's connection, probing it first if it has been sitting idle.
+   *
+   * The probe is shared: without this, five callers arriving together on an
+   * idle connection each send their own NOOP to answer the same question.
+   */
+  private async resolveImapConnection(
+    accountName: string,
+    entry: PooledImapConnection,
+  ): Promise<ImapFlow> {
+    // Connected and used recently — nothing to check.
+    if (entry.isFresh() && entry.client) {
+      entry.markUsed();
+      return entry.client;
     }
 
-    // Clean up stale connection
-    if (existing) {
-      this.imapClients.delete(accountName);
-      try {
-        existing.close();
-      } catch {
-        /* ignore */
+    return entry.revalidateOnce(async () => this.revalidateImapConnection(accountName, entry));
+  }
+
+  /** Probe a slot's connection and rebuild it if it does not answer. */
+  private async revalidateImapConnection(
+    accountName: string,
+    entry: PooledImapConnection,
+  ): Promise<ImapFlow> {
+    const client = await entry.ready;
+
+    if (client.usable) {
+      if (!entry.isStale()) {
+        entry.markUsed();
+        return client;
+      }
+      if (await ConnectionManager.respondsToProbe(client)) {
+        entry.markUsed();
+        return client;
       }
     }
 
+    await mcpLog(
+      'info',
+      'imap',
+      `Idle connection for "${accountName}" did not answer; reconnecting`,
+    );
+
+    try {
+      client.close();
+    } catch {
+      /* ignore */
+    }
+
+    // Rebuild in place where the slot survived, so a caller already holding it
+    // keeps its position in the pool. A 'close' listener may have removed it.
+    const pool = this.imapPools.get(accountName);
+    if (!pool?.includes(entry)) {
+      const replacement = this.selectImapConnection(accountName, false);
+      return this.resolveImapConnection(accountName, replacement);
+    }
+
+    entry.detach();
+    entry.startOpening(async () => this.openImapClient(accountName, entry));
+    return entry.ready;
+  }
+
+  /**
+   * The account's IMAP connection, for work whose duration is not tracked.
+   *
+   * Never opens a second connection: a caller that only holds a client cannot
+   * say when it is done with it, so growing here would open sockets that
+   * nothing measures the need for.
+   */
+  async getImapClient(accountName: string): Promise<ImapFlow> {
+    const entry = this.selectImapConnection(accountName, false);
+    return this.resolveImapConnection(accountName, entry);
+  }
+
+  /**
+   * Run one unit of IMAP work, spreading concurrent work across connections.
+   *
+   * This is what makes a Promise.all over IMAP calls actually concurrent.
+   * Holding the task means the pool knows when a connection frees up, which is
+   * what justifies opening another.
+   */
+  async withImapClient<T>(accountName: string, task: (client: ImapFlow) => Promise<T>): Promise<T> {
+    const entry = this.selectImapConnection(accountName, true);
+    entry.beginTask();
+    try {
+      const client = await this.resolveImapConnection(accountName, entry);
+      return await task(client);
+    } finally {
+      entry.endTask();
+    }
+  }
+
+  /**
+   * Open into a reserved slot, freeing the slot if the connection never comes up.
+   *
+   * A slot left holding a rejected promise would be joined by every later
+   * caller, and the account would never recover.
+   */
+  private async openImapClientOrReleaseSlot(
+    accountName: string,
+    entry: PooledImapConnection,
+  ): Promise<ImapFlow> {
+    try {
+      return await this.openImapClient(accountName, entry);
+    } catch (err) {
+      this.removeFromPool(accountName, entry);
+      throw err;
+    }
+  }
+
+  /** Build and connect a client into an already-reserved pool slot. */
+  private async openImapClient(
+    accountName: string,
+    entry: PooledImapConnection,
+  ): Promise<ImapFlow> {
     const account = this.getAccount(accountName);
 
     const auth = await buildImapAuth(account, this.oauthService);
@@ -107,16 +356,17 @@ export default class ConnectionManager implements IConnectionManager {
       },
       auth,
       logger: false,
+      disableCompression: DISABLE_COMPRESSION,
     });
 
-    this.registerImapLifecycle(accountName, client);
+    this.registerImapLifecycle(accountName, client, entry);
     await client.connect();
     await mcpLog(
       'info',
       'imap',
       `Connected to ${account.imap.host}:${account.imap.port} for "${accountName}"`,
     );
-    this.imapClients.set(accountName, client);
+    entry.attach(client);
     return client;
   }
 
@@ -323,15 +573,18 @@ export default class ConnectionManager implements IConnectionManager {
     await mcpLog('info', 'connections', 'Closing all connections');
     const closeOps: Promise<void>[] = [];
 
-    Array.from(this.imapClients.entries()).forEach(([name, client]) => {
-      closeOps.push(
-        client
-          .logout()
-          .catch(() => {})
-          .then(() => {
-            this.imapClients.delete(name);
-          }),
-      );
+    Array.from(this.imapPools.entries()).forEach(([name, pool]) => {
+      pool.forEach((entry) => {
+        closeOps.push(
+          // A slot may still be opening; wait for it rather than leaking the
+          // socket it is about to produce.
+          entry.ready
+            .then(async (client) => client.logout())
+            .catch(() => {})
+            .then(() => undefined),
+        );
+      });
+      this.imapPools.delete(name);
     });
 
     Array.from(this.smtpTransports.entries()).forEach(([name, transport]) => {

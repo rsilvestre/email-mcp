@@ -370,6 +370,7 @@ email = "you@gmail.com"
 full_name = "Your Name"
 password = "your-app-password"
 # sent_mailbox = "INBOX.Sent Messages"   # optional, see below
+# imap_pool_size = 8                     # optional, see below
 # save_to_sent = false                    # optional; skipped on Gmail by default
 
 [accounts.imap]
@@ -435,6 +436,24 @@ name = "personal"
 email = "you@example.com"
 sent_mailbox = "INBOX.Sent Messages"
 ```
+
+### `imap_pool_size`
+
+How many IMAP connections this account may open at once. Defaults to
+`MCP_EMAIL_IMAP_POOL_SIZE` (3).
+
+Worth raising only for an account whose server has no full-text index, where a
+wide search has to visit every folder in turn. That cost is round-trip latency
+rather than server work — measured at about 280 ms per folder whether it holds
+nothing or several hundred messages — so the account gets through its folders
+roughly in proportion to the connections allowed. An account measured here with
+309 folders reached 95 of them within the search deadline on three connections.
+
+Check what the server permits before raising it; the one measured here accepted
+twelve. An account whose server does index its mail gains nothing: Gmail covers
+every label with a single All Mail search, and spare connections only take
+throughput from the one doing the work.
+
 
 Use the folder's full IMAP path, as `list_mailboxes` reports it. When the copy cannot be filed, the
 message is still sent and the tool result says where it failed.
@@ -505,8 +524,65 @@ For single-account setups (overrides config file):
 | `MCP_EMAIL_SMTP_POOL_MAX_CONNECTIONS` | `1` | Max pooled SMTP connections |
 | `MCP_EMAIL_SMTP_POOL_MAX_MESSAGES` | `100` | Max messages per pooled connection |
 | `MCP_EMAIL_RATE_LIMIT` | `10` | Max sends per minute |
+| `MCP_EMAIL_IMAP_IDLE_PROBE_MS` | `60000` | Idle time after which a pooled IMAP connection is probed before reuse (`0` disables probing) |
+| `MCP_EMAIL_IMAP_PROBE_TIMEOUT_MS` | `5000` | How long that probe may take before the connection is rebuilt |
+| `MCP_EMAIL_IMAP_POOL_SIZE` | `3` | Most IMAP connections opened per account for concurrent work |
+| `MCP_EMAIL_SEARCH_DEADLINE_MS` | `15000` | Time budget for a search spanning several folders; unfinished folders are reported, not waited for |
+| `MCP_EMAIL_IMAP_DISABLE_COMPRESSION` | `false` | Set `true` to skip COMPRESS=DEFLATE (profiling and proxy traces) |
 
 ¹ One of `MCP_EMAIL_PASSWORD`, `MCP_EMAIL_PASSWORD_COMMAND`, or the OAuth2 variables is required.
+
+The `MCP_EMAIL_IMAP_*` connection variables apply however accounts are
+configured, file or environment. IMAP connections are pooled for the life of
+the process, and `ImapFlow.usable` only turns false once the socket reports an
+error or close — a connection dropped silently (an idle session reaped by the
+server, a NAT mapping expiring without an RST) stays marked usable, so the next
+call issues its command into a dead socket and stalls until something times
+out. Probing a connection that has been idle past the threshold turns that
+stall into a fast reconnect. Raise the threshold to probe less often; set it to
+`0` to disable probing entirely and accept the stalls.
+
+`MCP_EMAIL_IMAP_POOL_SIZE` bounds how many IMAP connections one account may
+use at once. imapflow runs commands on a connection one at a time, so tools
+that fan out — reading twenty messages, or listing folders with their unread
+counts — otherwise run single file no matter how they are written. Extra
+connections open only while work is actually waiting, never for sequential
+calls, and a spare that has been idle past the probe threshold is closed
+rather than probed — so an idle account settles back to a single connection.
+That reaping is deliberate: a server shares an account's throughput across its
+connections, and holding spares open measurably slowed unrelated sequential
+work. Lower the setting to `1` for a server with a tight per-account connection
+limit; that restores the older, fully sequential behaviour.
+
+`MCP_EMAIL_SEARCH_DEADLINE_MS` bounds `search_emails` when `scope` is wider than
+one folder. How wide a search costs depends entirely on the server: one that
+indexes its mail answers whatever the folder count — Gmail returns in under a
+second across 147 labels, because a single All Mail search covers every one of
+them. A server without an index is linear in folders, and an account measured
+here with 309 folders took 77 seconds for the same query. Past the deadline the
+search returns what it has and names the folders it skipped, so a partial answer
+is never mistaken for a complete one.
+
+On such a server the body term is decided per folder, from the size SELECT
+reports anyway. The scan is what costs, and it is proportional to the folder:
+measured at 276 ms on a twenty-message folder against 262 ms for headers alone,
+but 4223 ms on a folder of several hundred. So bodies are searched everywhere
+except the few large folders, which the result names.
+
+Where an account's folders are searched one by one, the cost is round-trip
+latency rather than server work — about 280 ms per folder whether it holds
+nothing or several hundred messages — so such an account gets through its
+folders roughly in proportion to the connections it may open. Set
+`imap_pool_size` on that account (see the account options above) rather than
+raising the global default, which would open connections that indexed accounts
+have no use for.
+
+`MCP_EMAIL_IMAP_DISABLE_COMPRESSION` exists for measurement. Compression is
+on by default and worth keeping: the only reason to turn it off is that the
+deflate stream keeps its dictionary for the life of the connection, so
+repeating a request costs almost nothing on the wire no matter how large the
+payload — which makes transferred bytes impossible to read from a packet
+capture or a socket counter.
 
 ### Email Scheduling
 

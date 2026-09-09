@@ -25,11 +25,20 @@ import type {
   EmailStats,
   LabelInfo,
   Mailbox,
+  MailboxSnapshot,
   PaginatedResult,
   QuotaInfo,
   SenderStat,
 } from '../types/index.js';
-import { buildPreview, findPreviewPart, PREVIEW_PART_BYTES } from '../utils/body-preview.js';
+import type { BodyTextParts, PreviewPart } from '../utils/body-preview.js';
+import {
+  buildPreview,
+  decodeCharset,
+  decodeTransferEncoding,
+  findBodyTextParts,
+  findPreviewPart,
+  PREVIEW_PART_BYTES,
+} from '../utils/body-preview.js';
 import { BULK_HEADER_FIELDS, classifyBulk, parseHeaderBlock } from '../utils/bulk-headers.js';
 import { buildRawMessage, resolveAttachments } from '../utils/mail-attachments.js';
 import type { LabelStrategy } from './label-strategy.js';
@@ -229,6 +238,187 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
   };
 }
 
+/**
+ * Read one text part off the wire and decode it.
+ *
+ * Returns undefined rather than throwing: a structure can name a section the
+ * server then refuses, and a message with an unreadable body is still worth
+ * returning with its headers intact.
+ */
+/**
+ * Most matches pulled from any one folder when merging results.
+ *
+ * A cross-folder search has to sort by date across sources, which needs each
+ * candidate's envelope. Without a ceiling, a broad query on a large mailbox
+ * would fetch envelopes for everything it matched just to show twenty rows.
+ */
+const MAX_CANDIDATES_PER_SOURCE = 200;
+
+/**
+ * How long a search spanning several folders may run before returning what it
+ * has.
+ *
+ * A server that indexes its mail answers whatever the folder count: Gmail
+ * returns in well under a second across 147 labels, because All Mail is one
+ * search. A server without an index is linear in folders and in message size —
+ * an account measured here with 309 folders took 77 seconds for the same
+ * query. Waiting that long is worse than a partial answer that says so.
+ */
+const CROSS_FOLDER_DEADLINE_MS = Number(process.env.MCP_EMAIL_SEARCH_DEADLINE_MS ?? 15_000);
+
+/**
+ * Folder size up to which searching message bodies is affordable on a server
+ * with no full-text index.
+ *
+ * Measured against one such account: a body search costs 276 ms on a folder of
+ * twenty messages against 262 ms for headers alone — the round trip dominates,
+ * the scan is free. The same search costs 4223 ms on a folder of several
+ * hundred. So the body term is worth including almost everywhere, and worth
+ * dropping only on the handful of large folders.
+ *
+ * The size comes from the SELECT the search performs anyway, so deciding this
+ * per folder costs nothing.
+ */
+const BODY_SEARCH_MAX_MESSAGES = 50;
+
+/** Counters asked of every folder when listing mailboxes. */
+const MAILBOX_STATUS_FIELDS = { messages: true, unseen: true } as const;
+
+/**
+ * First batch of UIDs examined when a filter has to be applied client-side.
+ *
+ * Batches grow geometrically from here. A fixed size gets the dense case right
+ * and the sparse case wrong: where matches are rare, filling one page of twenty
+ * took eight round trips, which measured slower than the whole-set fetch it
+ * replaced even though it moved fewer bytes.
+ */
+const ATTACHMENT_FILTER_FIRST_BATCH = 250;
+
+/** How much larger each subsequent batch is, once the first proves too small. */
+const ATTACHMENT_FILTER_GROWTH = 4;
+
+/** Ceiling on a single batch, so one fetch cannot name an unbounded UID list. */
+const ATTACHMENT_FILTER_MAX_BATCH = 4000;
+
+interface FilteredPage {
+  pageUids: number[];
+  /** Matches confirmed so far — a lower bound unless the scan ran to the end. */
+  total: number;
+  hasMore: boolean;
+  totalIsLowerBound: boolean;
+}
+
+/**
+ * Page through a UID set under the hasAttachment filter.
+ *
+ * IMAP cannot search on the presence of an attachment, so the structure of
+ * each candidate has to be fetched and inspected. Doing that for the entire
+ * match set before paginating meant a BODYSTRUCTURE fetch of the whole mailbox
+ * to return twenty rows.
+ *
+ * Instead the sorted UIDs are examined in batches and the scan stops once the
+ * page is full. The cost of `total` is what changes: it now counts only what
+ * was examined, and the caller is told so rather than being handed a number
+ * that looks exact.
+ */
+async function selectPageWithAttachmentFilter(
+  client: ImapFlow,
+  sortedUids: number[],
+  wantsAttachment: boolean,
+  skipCount: number,
+  pageSize: number,
+): Promise<FilteredPage> {
+  // One past the page tells us whether anything follows it.
+  const needed = skipCount + pageSize + 1;
+  const matches: number[] = [];
+  let examinedAll = true;
+  let batchSize = ATTACHMENT_FILTER_FIRST_BATCH;
+  let offset = 0;
+
+  while (offset < sortedUids.length) {
+    if (matches.length >= needed) {
+      examinedAll = false;
+      break;
+    }
+
+    const batch = sortedUids.slice(offset, offset + batchSize);
+    // Advance by what this batch actually covered, then widen the next look.
+    // Growing before advancing would step over the UIDs in between and drop
+    // them from the results entirely.
+    offset += batch.length;
+    batchSize = Math.min(batchSize * ATTACHMENT_FILTER_GROWTH, ATTACHMENT_FILTER_MAX_BATCH);
+    const structureByUid = new Map<number, unknown>();
+    // eslint-disable-next-line no-restricted-syntax, no-await-in-loop
+    for await (const msg of client.fetch(
+      batch.join(','),
+      { uid: true, bodyStructure: true },
+      { uid: true },
+    )) {
+      const raw = msg as unknown as Record<string, unknown>;
+      structureByUid.set(raw.uid as number, raw.bodyStructure);
+    }
+
+    // Iterate the batch, not the fetch, so ordering is the sorted one.
+    batch.forEach((uid) => {
+      if (hasAttachments(structureByUid.get(uid)) === wantsAttachment) {
+        matches.push(uid);
+      }
+    });
+  }
+
+  return {
+    pageUids: matches.slice(skipCount, skipCount + pageSize),
+    total: matches.length,
+    hasMore: matches.length > skipCount + pageSize,
+    totalIsLowerBound: !examinedAll,
+  };
+}
+
+async function downloadTextPart(
+  client: ImapFlow,
+  uid: number,
+  part: PreviewPart,
+): Promise<string | undefined> {
+  try {
+    const downloaded = await client.download(String(uid), part.key, { uid: true });
+    if (!downloaded?.content) return undefined;
+
+    const chunks: Buffer[] = [];
+    // eslint-disable-next-line no-restricted-syntax
+    for await (const chunk of downloaded.content) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return decodeCharset(
+      decodeTransferEncoding(Buffer.concat(chunks), part.encoding),
+      part.charset,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Fetch the readable body, preferring the plain-text alternative.
+ *
+ * Only one part is fetched. Downloading both alternatives would cost an extra
+ * round trip per message for a second copy of the same content: every consumer
+ * reads `bodyText ?? bodyHtml`, so the one the sender wrote for humans is the
+ * one worth having.
+ */
+async function fetchBody(
+  client: ImapFlow,
+  uid: number,
+  parts: BodyTextParts,
+): Promise<{ bodyText?: string; bodyHtml?: string }> {
+  if (parts.plain) {
+    return { bodyText: await downloadTextPart(client, uid, parts.plain) };
+  }
+  if (parts.html) {
+    return { bodyHtml: await downloadTextPart(client, uid, parts.html) };
+  }
+  return {};
+}
+
 async function messageToEmail(
   msg: Record<string, unknown>,
   client: ImapFlow,
@@ -237,44 +427,20 @@ async function messageToEmail(
   const meta = messageToEmailMeta(msg);
   const envelope = (msg.envelope ?? {}) as Record<string, unknown>;
 
-  // Parse full source for body content
-  let bodyText: string | undefined;
-  let bodyHtml: string | undefined;
+  // Headers come from BODY.PEEK[HEADER]; parseHeaderBlock unfolds RFC 5322
+  // continuation lines, which naive line splitting truncates on fields such as
+  // List-Unsubscribe.
   const headers: Record<string, string> = {};
-
-  if (msg.source && Buffer.isBuffer(msg.source)) {
-    const raw = msg.source.toString('utf-8');
-    const headerEnd = raw.indexOf('\r\n\r\n');
-    if (headerEnd >= 0) {
-      // parseHeaderBlock unfolds RFC 5322 continuation lines; naive line
-      // splitting truncates folded fields such as List-Unsubscribe.
-      Object.assign(headers, parseHeaderBlock(raw.slice(0, headerEnd)));
-
-      const body = raw.slice(headerEnd + 4);
-      // Simple content type detection
-      const contentType = headers['content-type'] ?? '';
-      if (contentType.includes('text/html')) {
-        bodyHtml = body;
-      } else {
-        bodyText = body;
-      }
-    }
+  if (msg.headers && Buffer.isBuffer(msg.headers)) {
+    Object.assign(headers, parseHeaderBlock(msg.headers.toString('utf-8')));
   }
 
-  // Try to get text/html parts via download if body parsing was simple
-  try {
-    const textPart = await client.download(String(uid), '1', { uid: true });
-    if (textPart?.content) {
-      const chunks: Buffer[] = [];
-      // eslint-disable-next-line no-restricted-syntax
-      for await (const chunk of textPart.content) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      bodyText = Buffer.concat(chunks).toString('utf-8');
-    }
-  } catch {
-    // Part may not exist
-  }
+  // The body is fetched by MIME section rather than sliced out of the full
+  // source. Slicing at the header boundary hands back the raw multipart body —
+  // boundaries, base64 attachments and all — whenever the message is not a bare
+  // text/plain, which is why this used to be papered over by unconditionally
+  // re-downloading section 1 afterwards.
+  const { bodyText, bodyHtml } = await fetchBody(client, uid, findBodyTextParts(msg.bodyStructure));
 
   return {
     ...meta,
@@ -331,14 +497,29 @@ export default class ImapService {
 
   async listMailboxes(accountName: string): Promise<Mailbox[]> {
     const client = await this.connections.getImapClient(accountName);
-    const mailboxes = await client.list();
 
+    // LIST-STATUS (RFC 5819) returns every folder's counters inline with the
+    // folder list, turning what was LIST plus one STATUS per folder into a
+    // single command. Gmail advertises it; a plain Dovecot may not.
+    if (client.capabilities.has('LIST-STATUS')) {
+      const listed = await client.list({ statusQuery: MAILBOX_STATUS_FIELDS });
+      return listed.map((mb) => ({
+        name: mb.name,
+        path: mb.path,
+        specialUse: mb.specialUse ?? undefined,
+        totalMessages: mb.status?.messages ?? 0,
+        unseenMessages: mb.status?.unseen ?? 0,
+      }));
+    }
+
+    // Without the extension it is one STATUS per folder. Issued through the
+    // pool so they genuinely overlap — imapflow's own fallback would run them
+    // in turn on a single connection.
+    const mailboxes = await client.list();
     const statusResults = await Promise.allSettled(
       mailboxes.map(async (mb) => {
-        const status = await client.status(mb.path, {
-          messages: true,
-          unseen: true,
-        });
+        const readStatus = async (c: ImapFlow) => c.status(mb.path, MAILBOX_STATUS_FIELDS);
+        const status = await this.connections.withImapClient(accountName, readStatus);
         return {
           name: mb.name,
           path: mb.path,
@@ -406,24 +587,7 @@ export default class ImapService {
 
       // Search for matching UIDs
       const searchResult = await client.search(search, { uid: true });
-      let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
-
-      // Post-filter for hasAttachment (IMAP has no native attachment search)
-      if (options.hasAttachment !== undefined && uids.length > 0) {
-        const filteredUids: number[] = [];
-        // eslint-disable-next-line no-restricted-syntax
-        for await (const msg of client.fetch(
-          uids.join(','),
-          { uid: true, bodyStructure: true },
-          { uid: true },
-        )) {
-          const raw = msg as unknown as Record<string, unknown>;
-          if (options.hasAttachment === hasAttachments(raw.bodyStructure)) {
-            filteredUids.push(raw.uid as number);
-          }
-        }
-        uids = filteredUids;
-      }
+      const uids: number[] = Array.isArray(searchResult) ? searchResult : [];
 
       if (uids.length === 0) {
         return {
@@ -435,11 +599,32 @@ export default class ImapService {
         };
       }
 
-      // Sort descending (newest first) and paginate
+      // Sort descending (newest first), then paginate.
       uids.sort((a, b) => b - a);
-      const total = uids.length;
       const start = (page - 1) * pageSize;
-      const pageUids = uids.slice(start, start + pageSize);
+
+      // hasAttachment has no IMAP equivalent, so it is resolved by inspecting
+      // message structure in batches until the page is full — rather than
+      // fetching BODYSTRUCTURE for every match before slicing twenty rows out.
+      const {
+        pageUids,
+        total,
+        hasMore: moreAfterPage,
+        totalIsLowerBound,
+      } = options.hasAttachment === undefined
+        ? {
+            pageUids: uids.slice(start, start + pageSize),
+            total: uids.length,
+            hasMore: start + pageSize < uids.length,
+            totalIsLowerBound: false,
+          }
+        : await selectPageWithAttachmentFilter(
+            client,
+            uids,
+            options.hasAttachment,
+            start,
+            pageSize,
+          );
 
       if (pageUids.length === 0) {
         return {
@@ -448,6 +633,7 @@ export default class ImapService {
           page,
           pageSize,
           hasMore: false,
+          ...(totalIsLowerBound ? { totalIsLowerBound } : {}),
         };
       }
 
@@ -489,7 +675,8 @@ export default class ImapService {
         total,
         page,
         pageSize,
-        hasMore: start + pageSize < total,
+        hasMore: moreAfterPage,
+        ...(totalIsLowerBound ? { totalIsLowerBound } : {}),
       };
     } finally {
       lock.release();
@@ -501,7 +688,18 @@ export default class ImapService {
   // -------------------------------------------------------------------------
 
   async getEmail(accountName: string, emailId: string, mailbox = 'INBOX'): Promise<Email> {
-    const client = await this.connections.getImapClient(accountName);
+    // Through the pool rather than the shared connection: get_emails fans out
+    // over as many as 20 ids, and on one connection those run strictly in turn.
+    const readEmail = async (c: ImapFlow) => ImapService.fetchEmailOn(c, emailId, mailbox);
+    return this.connections.withImapClient(accountName, readEmail);
+  }
+
+  /** Read one message on a given connection. */
+  private static async fetchEmailOn(
+    client: ImapFlow,
+    emailId: string,
+    mailbox: string,
+  ): Promise<Email> {
     const uid = parseInt(emailId, 10);
     const safeMailbox = sanitizeMailboxName(mailbox);
 
@@ -514,7 +712,10 @@ export default class ImapService {
           envelope: true,
           flags: true,
           bodyStructure: true,
-          source: true,
+          // BODY.PEEK[HEADER], not BODY.PEEK[]. Fetching the whole message
+          // pulled every attachment down to display its text, and `maxLength`
+          // trims the output afterwards rather than the bytes.
+          headers: true,
         },
         { uid: true },
       );
@@ -644,6 +845,293 @@ export default class ImapService {
   // Search emails
   // -------------------------------------------------------------------------
 
+  /**
+   * Build the IMAP SEARCH criteria shared by the single- and multi-folder paths.
+   */
+  private static buildSearchCriteria(
+    sanitizedQuery: string,
+    options: {
+      to?: string;
+      largerThan?: number;
+      smallerThan?: number;
+      answered?: boolean;
+    },
+    includeBody = true,
+  ): Record<string, unknown> {
+    // Base query ORs across subject, sender and — where it is affordable — body.
+    const terms: Record<string, unknown>[] = [
+      { subject: sanitizedQuery },
+      { from: sanitizedQuery },
+      ...(includeBody ? [{ body: sanitizedQuery }] : []),
+    ];
+    const baseCriteria: Record<string, unknown> = sanitizedQuery ? { or: terms } : {};
+
+    const andConditions: Record<string, unknown>[] = [baseCriteria];
+    if (options.to) {
+      andConditions.push({ to: options.to });
+    }
+    if (options.largerThan !== undefined) {
+      andConditions.push({ larger: options.largerThan * 1024 });
+    }
+    if (options.smallerThan !== undefined) {
+      andConditions.push({ smaller: options.smallerThan * 1024 });
+    }
+    if (options.answered === true) {
+      andConditions.push({ answered: true });
+    } else if (options.answered === false) {
+      andConditions.push({ answered: false });
+    }
+
+    if (andConditions.length === 1) return baseCriteria;
+
+    const combined: Record<string, unknown> = {};
+    andConditions.forEach((condition) => {
+      Object.assign(combined, condition);
+    });
+    return combined;
+  }
+
+  /** Fetch listing metadata for a set of UIDs in the currently selected mailbox. */
+  private static async fetchMetasFor(
+    client: ImapFlow,
+    uids: number[],
+    withPreview: boolean,
+  ): Promise<EmailMeta[]> {
+    if (uids.length === 0) return [];
+
+    const raw: Record<string, unknown>[] = [];
+    // eslint-disable-next-line no-restricted-syntax
+    for await (const msg of client.fetch(
+      uids.join(','),
+      {
+        uid: true,
+        envelope: true,
+        flags: true,
+        bodyStructure: true,
+        headers: BULK_HEADER_FIELDS,
+        ...(withPreview
+          ? { bodyParts: [{ key: '1', start: 0, maxLength: PREVIEW_PART_BYTES }] }
+          : {}),
+      },
+      { uid: true },
+    )) {
+      raw.push(msg as unknown as Record<string, unknown>);
+    }
+
+    if (withPreview) {
+      await fetchNestedPreviews(client, raw);
+    }
+
+    return raw.map((msg) => messageToEmailMeta(msg));
+  }
+
+  /**
+   * Folders worth searching for an account.
+   *
+   * Gmail files every message under All Mail whatever labels it carries, so one
+   * folder covers the whole account. Elsewhere it means every real folder;
+   * Trash and Junk are left out, which is also what All Mail excludes.
+   */
+  private static async searchableMailboxes(
+    client: ImapFlow,
+  ): Promise<{ mailboxes: string[]; indexed: boolean }> {
+    const mailboxes = await client.list();
+
+    const allMail = mailboxes.find((mb) => mb.specialUse === '\\All');
+    if (allMail && client.capabilities.has('X-GM-EXT-1')) {
+      // One folder holding every message, searched by the server's own index.
+      return { mailboxes: [allMail.path], indexed: true };
+    }
+
+    const skipped = new Set(['\\All', '\\Flagged', '\\Trash', '\\Junk']);
+    const searchable = mailboxes
+      .filter((mb) => mb.listed && !mb.flags?.has('\\Noselect'))
+      .filter(
+        (mb) => !skipped.has(mb.specialUse ?? '') && ![...skipped].some((f) => mb.flags?.has(f)),
+      );
+
+    // Most likely first, so a search cut short by the deadline has spent its
+    // time on the folders the answer is most likely to be in.
+    return {
+      mailboxes: ImapService.orderByLikelihood(searchable).map((mb) => mb.path),
+      indexed: false,
+    };
+  }
+
+  /** What every folder in one cross-folder search has in common. */
+  private static asSearchPlan(plan: {
+    /** Used where the server indexes, or where the folder is small enough. */
+    criteriaWithBody: Record<string, unknown>;
+    /** Used on a large folder of a server that has to scan for a body match. */
+    criteriaHeadersOnly: Record<string, unknown>;
+    /** True when the server indexes, so folder size does not matter. */
+    indexed: boolean;
+    candidateLimit: number;
+    withPreview: boolean;
+  }) {
+    return plan;
+  }
+
+  /** Search one folder and return its newest matches, tagged with their source. */
+  private async searchOneMailbox(
+    accountName: string,
+    mailbox: string,
+    plan: ReturnType<typeof ImapService.asSearchPlan>,
+  ): Promise<{
+    mailbox: string;
+    metas: EmailMeta[];
+    matched: number;
+    capped: boolean;
+    bodySkipped: boolean;
+  }> {
+    const { candidateLimit, withPreview } = plan;
+    return this.connections.withImapClient(accountName, async (client) => {
+      const lock = await client.getMailboxLock(mailbox);
+      try {
+        // SELECT has just reported how many messages the folder holds, so
+        // choosing here costs nothing.
+        const selected = client.mailbox;
+        const messageCount = typeof selected === 'object' ? (selected.exists ?? 0) : 0;
+        const affordable = plan.indexed || messageCount <= BODY_SEARCH_MAX_MESSAGES;
+        const criteria = affordable ? plan.criteriaWithBody : plan.criteriaHeadersOnly;
+
+        const found = await client.search(criteria, { uid: true });
+        const uids = (Array.isArray(found) ? found : []).sort((a, b) => b - a);
+        // UIDs rise with arrival, so the newest by UID are the newest by date.
+        // Taking only as many as a page could need keeps the envelope fetch
+        // bounded no matter how many messages matched.
+        const candidates = uids.slice(0, candidateLimit);
+        const metas = await ImapService.fetchMetasFor(client, candidates, withPreview);
+        return {
+          mailbox,
+          metas: metas.map((meta) => ({ ...meta, account: accountName, mailbox })),
+          matched: uids.length,
+          capped: uids.length > candidates.length,
+          bodySkipped: !affordable,
+        };
+      } finally {
+        lock.release();
+      }
+    });
+  }
+
+  /**
+   * Search across folders, and optionally across accounts.
+   *
+   * Every source is searched by the server; nothing is filtered here. Results
+   * carry the account and folder they came from, because a UID is meaningless
+   * without them — a caller cannot move or delete a result otherwise.
+   */
+  async searchAcross(
+    scope: string[] | 'all',
+    query: string,
+    options: {
+      page?: number;
+      pageSize?: number;
+      to?: string;
+      largerThan?: number;
+      smallerThan?: number;
+      answered?: boolean;
+      preview?: boolean;
+    } = {},
+  ): Promise<PaginatedResult<EmailMeta>> {
+    // Resolving 'all' here keeps the account list out of the tool layer, which
+    // has no connection manager of its own.
+    const accountNames = scope === 'all' ? this.connections.getAccountNames() : scope;
+
+    const page = options.page ?? 1;
+    const pageSize = options.pageSize ?? 20;
+    const start = (page - 1) * pageSize;
+    const sanitizedQuery = query ? sanitizeSearchQuery(query) : '';
+    // Enough from each source that merging them can fill the requested page.
+    const candidateLimit = Math.min(start + pageSize, MAX_CANDIDATES_PER_SOURCE);
+    const withPreview = options.preview ?? false;
+
+    // One deadline for the whole search, not one per folder: what a caller
+    // cares about is when an answer arrives, and a per-folder timeout still
+    // adds up to minutes across three hundred of them.
+    let deadlineTimer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<'deadline'>((resolve) => {
+      deadlineTimer = setTimeout(() => resolve('deadline'), CROSS_FOLDER_DEADLINE_MS);
+      deadlineTimer.unref?.();
+    });
+
+    const collected: EmailMeta[] = [];
+    const incompleteSources: string[] = [];
+    const bodySkippedFolders: string[] = [];
+    let matched = 0;
+    let capped = false;
+
+    try {
+      const perAccount = await Promise.all(
+        accountNames.map(async (accountName) => {
+          const client = await this.connections.getImapClient(accountName);
+          const { mailboxes, indexed } = await ImapService.searchableMailboxes(client);
+
+          // The body term is decided per folder, once SELECT has said how big
+          // the folder is — see BODY_SEARCH_MAX_MESSAGES. Both variants are
+          // built once here rather than per folder.
+          const plan = ImapService.asSearchPlan({
+            criteriaWithBody: ImapService.buildSearchCriteria(sanitizedQuery, options, true),
+            criteriaHeadersOnly: ImapService.buildSearchCriteria(sanitizedQuery, options, false),
+            indexed,
+            candidateLimit,
+            withPreview,
+          });
+
+          const search = async (mb: string) => {
+            const outcome = await Promise.race([
+              this.searchOneMailbox(accountName, mb, plan),
+              deadline,
+            ]);
+            return outcome === 'deadline' ? { source: `${accountName}/${mb}` } : outcome;
+          };
+          return Promise.allSettled(mailboxes.map(search));
+        }),
+      );
+
+      perAccount.flat().forEach((outcome) => {
+        // A folder that cannot be selected or searched drops out rather than
+        // failing the whole search.
+        if (outcome.status !== 'fulfilled') return;
+        if ('source' in outcome.value) {
+          incompleteSources.push(outcome.value.source);
+          return;
+        }
+        collected.push(...outcome.value.metas);
+        matched += outcome.value.matched;
+        capped ||= outcome.value.capped;
+        if (outcome.value.bodySkipped) bodySkippedFolders.push(outcome.value.mailbox);
+      });
+    } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+    }
+
+    // The same message can sit in several folders — Gmail labels most of all.
+    const bySource = new Map<string, EmailMeta>();
+    collected.forEach((meta) => {
+      const key = `${meta.account}\u0000${meta.id}\u0000${meta.mailbox}`;
+      bySource.set(key, meta);
+    });
+
+    const merged = [...bySource.values()].sort(
+      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime(),
+    );
+
+    return {
+      items: merged.slice(start, start + pageSize),
+      total: matched,
+      page,
+      pageSize,
+      hasMore: merged.length > start + pageSize || capped,
+      // Either the per-source cap or an unfinished source means the count is a
+      // floor, not a total.
+      ...(capped || incompleteSources.length > 0 ? { totalIsLowerBound: true } : {}),
+      ...(incompleteSources.length > 0 ? { incompleteSources } : {}),
+      ...(bodySkippedFolders.length > 0 ? { bodyNotSearched: bodySkippedFolders } : {}),
+    };
+  }
+
   async searchEmails(
     accountName: string,
     query: string,
@@ -668,56 +1156,10 @@ export default class ImapService {
 
     const lock = await client.getMailboxLock(mailbox);
     try {
-      // Build search criteria — base query OR across subject/from/body
-      const baseCriteria: Record<string, unknown> = sanitizedQuery
-        ? { or: [{ subject: sanitizedQuery }, { from: sanitizedQuery }, { body: sanitizedQuery }] }
-        : {};
-
-      // Build additional filters as AND conditions
-      const andConditions: Record<string, unknown>[] = [baseCriteria];
-
-      if (options.to) {
-        andConditions.push({ to: options.to });
-      }
-      if (options.largerThan !== undefined) {
-        andConditions.push({ larger: options.largerThan * 1024 });
-      }
-      if (options.smallerThan !== undefined) {
-        andConditions.push({ smaller: options.smallerThan * 1024 });
-      }
-      if (options.answered === true) {
-        andConditions.push({ answered: true });
-      } else if (options.answered === false) {
-        andConditions.push({ answered: false });
-      }
-
-      // Use the combined criteria or just the base
-      const searchCriteria =
-        andConditions.length === 1 ? baseCriteria : Object.assign({}, ...andConditions);
+      const searchCriteria = ImapService.buildSearchCriteria(sanitizedQuery, options);
 
       const searchResult = await client.search(searchCriteria, { uid: true });
-      let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
-
-      // Post-filter for has_attachment if requested (IMAP doesn't have native support)
-      if (options.hasAttachment !== undefined && uids.length > 0) {
-        const filteredUids: number[] = [];
-        const checkRange = uids.join(',');
-
-        // eslint-disable-next-line no-restricted-syntax
-        for await (const msg of client.fetch(
-          checkRange,
-          { uid: true, bodyStructure: true },
-          { uid: true },
-        )) {
-          const raw = msg as unknown as Record<string, unknown>;
-          const msgHasAtt = hasAttachments(raw.bodyStructure);
-          if (options.hasAttachment === msgHasAtt) {
-            filteredUids.push(raw.uid as number);
-          }
-        }
-
-        uids = filteredUids;
-      }
+      const uids: number[] = Array.isArray(searchResult) ? searchResult : [];
 
       if (uids.length === 0) {
         return {
@@ -730,9 +1172,28 @@ export default class ImapService {
       }
 
       uids.sort((a, b) => b - a);
-      const total = uids.length;
       const start = (page - 1) * pageSize;
-      const pageUids = uids.slice(start, start + pageSize);
+
+      // has_attachment has no IMAP equivalent; see selectPageWithAttachmentFilter.
+      const {
+        pageUids,
+        total,
+        hasMore: moreAfterPage,
+        totalIsLowerBound,
+      } = options.hasAttachment === undefined
+        ? {
+            pageUids: uids.slice(start, start + pageSize),
+            total: uids.length,
+            hasMore: start + pageSize < uids.length,
+            totalIsLowerBound: false,
+          }
+        : await selectPageWithAttachmentFilter(
+            client,
+            uids,
+            options.hasAttachment,
+            start,
+            pageSize,
+          );
 
       if (pageUids.length === 0) {
         return {
@@ -741,6 +1202,7 @@ export default class ImapService {
           page,
           pageSize,
           hasMore: false,
+          ...(totalIsLowerBound ? { totalIsLowerBound } : {}),
         };
       }
 
@@ -781,7 +1243,8 @@ export default class ImapService {
         total,
         page,
         pageSize,
-        hasMore: start + pageSize < total,
+        hasMore: moreAfterPage,
+        ...(totalIsLowerBound ? { totalIsLowerBound } : {}),
       };
     } finally {
       lock.release();
@@ -857,6 +1320,27 @@ export default class ImapService {
   // Find real folder for an email
   // -------------------------------------------------------------------------
 
+  /** Folders a message is most likely to be in, in the order worth searching. */
+  private static readonly LIKELY_SPECIAL_USE = ['\\Sent', '\\Drafts', '\\Archive'];
+
+  /**
+   * Order mailboxes so the first match is the one a caller would want to act
+   * on, since the search stops there.
+   */
+  private static orderByLikelihood<T extends { path: string; specialUse?: string }>(
+    mailboxes: T[],
+  ): T[] {
+    const rank = (mailbox: T): number => {
+      if (mailbox.path === 'INBOX') return 0;
+      const specialIndex = mailbox.specialUse
+        ? ImapService.LIKELY_SPECIAL_USE.indexOf(mailbox.specialUse)
+        : -1;
+      return specialIndex === -1 ? ImapService.LIKELY_SPECIAL_USE.length + 1 : specialIndex + 1;
+    };
+    // Stable within a rank, so the server's own ordering is otherwise kept.
+    return [...mailboxes].sort((a, b) => rank(a) - rank(b));
+  }
+
   async findEmailFolder(
     accountName: string,
     emailId: string,
@@ -897,9 +1381,20 @@ export default class ImapService {
       return true;
     });
 
-    // 3. Search each real mailbox for the Message-ID (sequential — each needs its own lock)
+    // 3. Search for the Message-ID, stopping at the first hit.
+    //
+    // Each folder costs a SELECT and a header SEARCH, and header SEARCH is
+    // typically an unindexed server-side scan. Continuing after a match spent
+    // that on every remaining folder to produce a list the caller was told to
+    // take the first entry of.
+    //
+    // Likely folders go first so the one hit is also the useful one: a message
+    // is far more often in INBOX or Sent than in an archive label, and on a
+    // label-based server it is in several folders at once.
+    const searchOrder = ImapService.orderByLikelihood(realMailboxes);
+
     const folders: string[] = [];
-    const searchMailbox = async (mbPath: string): Promise<void> => {
+    const findInMailbox = async (mbPath: string): Promise<boolean> => {
       try {
         const lock = await client.getMailboxLock(mbPath);
         try {
@@ -907,20 +1402,22 @@ export default class ImapService {
             { header: { 'message-id': messageId } },
             { uid: true },
           );
-          if (results && Array.isArray(results) && results.length > 0) {
-            folders.push(mbPath);
-          }
+          return Array.isArray(results) && results.length > 0;
         } finally {
           lock.release();
         }
       } catch {
         // Skip folders that can't be selected or searched (e.g. \Noselect, INBOX on some providers)
+        return false;
       }
     };
     // eslint-disable-next-line no-restricted-syntax
-    for (const mb of realMailboxes) {
+    for (const mb of searchOrder) {
       // eslint-disable-next-line no-await-in-loop
-      await searchMailbox(mb.path);
+      if (await findInMailbox(mb.path)) {
+        folders.push(mb.path);
+        break;
+      }
     }
 
     return { folders, messageId };
@@ -1478,6 +1975,44 @@ export default class ImapService {
   }
 
   /**
+   * Search one header against many values in as few commands as possible.
+   *
+   * One SEARCH per Message-ID was the dominant cost of building a thread:
+   * header SEARCH is typically an unindexed server-side scan, and a thread of
+   * twenty references issued sixty of them in sequence. IMAP can OR the terms
+   * into a single command instead.
+   *
+   * The OR chain is still chunked: imapflow nests OR pairwise, so an unbounded
+   * list produces a deeply nested command that some servers reject outright.
+   */
+  private static async searchHeaderAnyOf(
+    client: ImapFlow,
+    headerName: string,
+    values: string[],
+  ): Promise<number[]> {
+    const CHUNK = 25;
+    const found: number[] = [];
+
+    for (let offset = 0; offset < values.length; offset += CHUNK) {
+      const chunk = values.slice(offset, offset + CHUNK);
+      const criteria =
+        chunk.length === 1
+          ? { header: { [headerName]: chunk[0] } }
+          : { or: chunk.map((value) => ({ header: { [headerName]: value } })) };
+
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const result = await client.search(criteria, { uid: true });
+        if (Array.isArray(result)) found.push(...result);
+      } catch {
+        // Header search is not supported everywhere; a miss is not an error.
+      }
+    }
+
+    return found;
+  }
+
+  /**
    * Reconstruct an email thread by following References / In-Reply-To chains.
    * Searches by Message-ID header for each reference and returns messages in
    * chronological order. Caps at MAX_THREAD_MESSAGES to prevent runaway chains.
@@ -1499,6 +2034,11 @@ export default class ImapService {
       // Collect all Message-IDs in the thread
       const targetMsgIds = new Set<string>([messageId]);
 
+      // Set when the server threads messages itself: Gmail's X-GM-THRID, or
+      // THREADID from OBJECTID. Following References is the fallback for
+      // servers that do not.
+      let serverThreadId: string | undefined;
+
       // First, find the root message to get its References chain
       const rootSearch = await client.search(
         { header: { 'Message-ID': messageId } },
@@ -1509,80 +2049,58 @@ export default class ImapService {
       if (rootUids.length > 0) {
         const rootMsg = await client.fetchOne(
           String(rootUids[0]),
-          { uid: true, envelope: true, source: true },
+          // Only the References header is read below, so do not pull the body.
+          // threadId rides along at no extra cost and, where the server keeps
+          // its own threading, replaces the header chasing entirely.
+          { uid: true, envelope: true, headers: true, threadId: true },
           { uid: true },
         );
 
         if (rootMsg) {
           const raw = rootMsg as unknown as Record<string, unknown>;
+          if (typeof raw.threadId === 'string' && raw.threadId) {
+            serverThreadId = raw.threadId;
+          }
           const envelope = (raw.envelope ?? {}) as Record<string, unknown>;
           const inReplyTo = envelope.inReplyTo as string | undefined;
           if (inReplyTo) targetMsgIds.add(inReplyTo);
 
-          // Parse References header from source
-          if (raw.source && Buffer.isBuffer(raw.source)) {
-            const src = raw.source.toString('utf-8');
-            const refMatch = /^References:\s*(.+?)(?:\r?\n(?!\s))/ms.exec(src);
-            if (refMatch) {
-              refMatch[1]
-                .split(/\s+/)
-                .filter(Boolean)
-                .forEach((ref) => {
-                  targetMsgIds.add(ref);
-                });
-            }
+          // References comes from the fetched header block. parseHeaderBlock
+          // unfolds continuation lines, so a long reference chain wrapped over
+          // several lines is read whole rather than cut at the first newline.
+          if (raw.headers && Buffer.isBuffer(raw.headers)) {
+            const rootHeaders = parseHeaderBlock(raw.headers.toString('utf-8'));
+            rootHeaders.references
+              ?.split(/\s+/)
+              .filter(Boolean)
+              .forEach((ref) => {
+                targetMsgIds.add(ref);
+              });
           }
         }
       }
 
-      // Search for all related messages by Message-ID
-      const foundUids = new Set<number>();
-      // eslint-disable-next-line no-restricted-syntax
-      for (const msgId of targetMsgIds) {
-        if (foundUids.size >= MAX_THREAD_MESSAGES) break;
-
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          const searchResult = await client.search(
-            { header: { 'Message-ID': msgId } },
-            { uid: true },
-          );
-          if (Array.isArray(searchResult)) {
-            searchResult.forEach((uid) => {
-              foundUids.add(uid);
-            });
-          }
-        } catch {
-          // Header search may not be supported for all messages
-        }
-      }
-
-      // Also search for messages that reference any of our Message-IDs
-      // eslint-disable-next-line no-restricted-syntax
-      for (const msgId of targetMsgIds) {
-        if (foundUids.size >= MAX_THREAD_MESSAGES) break;
-
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          const refSearch = await client.search({ header: { References: msgId } }, { uid: true });
-          if (Array.isArray(refSearch)) {
-            refSearch.forEach((uid) => {
-              foundUids.add(uid);
-            });
-          }
-          // eslint-disable-next-line no-await-in-loop
-          const replySearch = await client.search(
-            { header: { 'In-Reply-To': msgId } },
-            { uid: true },
-          );
-          if (Array.isArray(replySearch)) {
-            replySearch.forEach((uid) => {
-              foundUids.add(uid);
-            });
-          }
-        } catch {
-          // Header search may fail on some servers
-        }
+      // Find the messages of the thread.
+      //
+      // Where the server threads for us, one search by thread id settles it,
+      // and it is also more accurate: a reply whose References chain was
+      // mangled in transit still carries the right thread id.
+      //
+      // Otherwise, follow the chain: those carrying one of the collected
+      // Message-IDs, and those replying to one — three OR'd searches rather
+      // than three per Message-ID.
+      let foundUids: Set<number>;
+      if (serverThreadId) {
+        const threaded = await client.search({ threadId: serverThreadId }, { uid: true });
+        foundUids = new Set<number>(Array.isArray(threaded) ? threaded : []);
+      } else {
+        const wantedIds = Array.from(targetMsgIds);
+        const matchedUidGroups = await Promise.all([
+          ImapService.searchHeaderAnyOf(client, 'Message-ID', wantedIds),
+          ImapService.searchHeaderAnyOf(client, 'References', wantedIds),
+          ImapService.searchHeaderAnyOf(client, 'In-Reply-To', wantedIds),
+        ]);
+        foundUids = new Set<number>(matchedUidGroups.flat());
       }
 
       if (foundUids.size === 0) {
@@ -1607,7 +2125,7 @@ export default class ImapService {
           envelope: true,
           flags: true,
           bodyStructure: true,
-          source: true,
+          headers: true,
         },
         { uid: true },
       )) {
@@ -1855,6 +2373,38 @@ export default class ImapService {
   // -------------------------------------------------------------------------
   // Quota
   // -------------------------------------------------------------------------
+
+  /**
+   * Mailbox counters without scanning the mailbox.
+   *
+   * STATUS answers the totals directly, and counting today's arrivals needs
+   * only the length of a SEARCH result — no envelopes, no body structure. Two
+   * round trips, whatever the mailbox holds.
+   */
+  async getMailboxSnapshot(accountName: string, mailbox = 'INBOX'): Promise<MailboxSnapshot> {
+    const client = await this.connections.getImapClient(accountName);
+    const safeMailbox = sanitizeMailboxName(mailbox);
+
+    const status = await client.status(safeMailbox, { messages: true, unseen: true });
+
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const lock = await client.getMailboxLock(safeMailbox);
+    let receivedToday = 0;
+    try {
+      const todayUids = await client.search({ since: startOfToday }, { uid: true });
+      receivedToday = Array.isArray(todayUids) ? todayUids.length : 0;
+    } finally {
+      lock.release();
+    }
+
+    return {
+      total: status.messages ?? 0,
+      unread: status.unseen ?? 0,
+      receivedToday,
+    };
+  }
 
   async getQuota(accountName: string): Promise<QuotaInfo | null> {
     const client = await this.connections.getImapClient(accountName);

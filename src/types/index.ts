@@ -75,6 +75,19 @@ export interface AccountConfig {
    */
   sentMailbox?: string;
   /**
+   * IMAP connections this account may open at once, overriding the global
+   * default.
+   *
+   * What an account needs depends on how its server answers a wide search. A
+   * server that indexes its mail needs one connection: Gmail covers every label
+   * with a single All Mail search. A server without one is searched folder by
+   * folder, and that cost is round-trip latency rather than server work —
+   * measured at ~280 ms per folder whether the folder holds nothing or several
+   * hundred messages. Such an account gets through its folders roughly in
+   * proportion to the connections it is allowed.
+   */
+  imapPoolSize?: number;
+  /**
    * File a copy of outgoing mail in the Sent folder. Defaults to true, except
    * on servers that already file sent mail themselves — see appendToSent.
    */
@@ -208,6 +221,13 @@ export interface EmailMeta {
   preview?: string;
   /** Set only for list or machine-generated mail; absent for personal mail. */
   bulk?: BulkSignal;
+  /**
+   * Where the message was found. Present only on results gathered from more
+   * than one place: a UID means nothing without the folder it belongs to, so a
+   * cross-folder result is unusable without these.
+   */
+  account?: string;
+  mailbox?: string;
 }
 
 export interface AttachmentMeta {
@@ -288,6 +308,33 @@ export interface PaginatedResult<T> {
   page: number;
   pageSize: number;
   hasMore: boolean;
+  /**
+   * Set when `total` counts only what has been examined so far, not the whole
+   * match set. Filters IMAP cannot express server-side are applied by fetching
+   * message structure in batches until the page is full, so the true total is
+   * unknown without scanning everything — which is the cost being avoided.
+   */
+  totalIsLowerBound?: boolean;
+  /**
+   * Sources that did not finish in time, as "account/folder".
+   *
+   * A search spanning many folders on a server with no full-text index can run
+   * for minutes. Rather than wait, it returns what arrived and names what did
+   * not, so the caller knows the answer is partial instead of assuming it is
+   * complete.
+   */
+  incompleteSources?: string[];
+  /**
+   * Folders whose message bodies were not searched, only their headers.
+   *
+   * On a server with no full-text index the cost of a body search is all in the
+   * scan, and the scan is proportional to the folder: measured at 276 ms on a
+   * twenty-message folder against 262 ms for headers alone, but 4223 ms on a
+   * folder of several hundred. Bodies are therefore searched everywhere except
+   * the few folders large enough to be worth skipping, and those are named
+   * rather than silently omitted.
+   */
+  bodyNotSearched?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +455,16 @@ export interface EmailStats {
   dailyVolume: DailyVolume[];
   hasAttachmentsCount: number;
   avgPerDay: number;
+}
+
+/** Cheap mailbox counters, from STATUS plus one SEARCH. */
+export interface MailboxSnapshot {
+  /** Messages in the mailbox. */
+  total: number;
+  /** Unread messages in the mailbox. */
+  unread: number;
+  /** Messages whose internal date falls today. */
+  receivedToday: number;
 }
 
 export interface QuotaInfo {

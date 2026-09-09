@@ -6,7 +6,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import type ImapService from '../services/imap.service.js';
-import type { Email, EmailMeta } from '../types/index.js';
+import type { Email, EmailMeta, PaginatedResult } from '../types/index.js';
 import { formatBulk } from '../utils/bulk-headers.js';
 
 // ---------------------------------------------------------------------------
@@ -34,8 +34,13 @@ function formatEmailMeta(email: EmailMeta): string {
   const bulk = formatBulk(email.bulk);
   const bulkStr = bulk ? `\n  ${bulk}` : '';
   const previewStr = email.preview ? `\n  ${email.preview}` : '';
+  // A UID is meaningless without the folder it belongs to, so a result gathered
+  // from several places has to name its own — otherwise nothing can act on it.
+  const sourceStr = email.mailbox
+    ? `\n  📍 ${email.account ? `${email.account} · ` : ''}${email.mailbox}`
+    : '';
 
-  return `[${email.id}] ${flags} ${email.subject}\n  From: ${from} | ${email.date}${labelStr}${bulkStr}${previewStr}`;
+  return `[${email.id}] ${flags} ${email.subject}\n  From: ${from} | ${email.date}${sourceStr}${labelStr}${bulkStr}${previewStr}`;
 }
 
 /** Strips HTML markup and decodes common entities to produce readable plain text. */
@@ -68,6 +73,26 @@ function stripReplyChain(text: string): string {
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/**
+ * Render a result count.
+ *
+ * A filter IMAP cannot express is resolved by inspecting messages until the
+ * page is full, so the count reflects what was examined rather than the whole
+ * match set. Printing that as an exact number would be a plain lie, and so
+ * would the page count derived from it.
+ */
+function formatResultCount(result: {
+  total: number;
+  page: number;
+  pageSize: number;
+  totalIsLowerBound?: boolean;
+}): string {
+  const pageCount = Math.max(1, Math.ceil(result.total / result.pageSize));
+  return result.totalIsLowerBound
+    ? `${result.total}+ (page ${result.page})`
+    : `${result.total} (page ${result.page}/${pageCount})`;
 }
 
 type BodyFormat = 'full' | 'text' | 'stripped';
@@ -173,8 +198,7 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
         }
 
         const header =
-          `📬 [${params.mailbox}] ${result.total} emails ` +
-          `(page ${result.page}/${Math.ceil(result.total / result.pageSize)})` +
+          `📬 [${params.mailbox}] ${formatResultCount(result)} emails` +
           `${result.hasMore ? ' — more pages available' : ''}\n`;
         const emails = result.items.map(formatEmailMeta).join('\n\n');
 
@@ -496,15 +520,30 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
       'Omit query (or pass an empty string) to use it as a pure filter — e.g. find all emails ' +
       'with attachments from a specific recipient without a keyword. ' +
       'Supports additional filters for recipient, attachments, size, and reply status. ' +
+      'Use scope to widen beyond one folder: "account" searches every folder of the account, ' +
+      '"all_accounts" searches them all. Widened results show 📍 the account and folder each ' +
+      'message was found in — pass that folder as mailbox to any follow-up tool. ' +
       'Results carry the same 📰 newsletter / 🤖 automated markers as list_emails.',
     {
-      account: z.string().describe('Account name from list_accounts'),
+      account: z
+        .string()
+        .optional()
+        .describe('Account name from list_accounts. Required unless scope is "all_accounts"'),
       query: z
         .string()
         .optional()
         .default('')
         .describe('Search keyword (omit or leave empty to use filters only)'),
-      mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
+      scope: z
+        .enum(['mailbox', 'account', 'all_accounts'])
+        .default('mailbox')
+        .describe(
+          'How wide to search: one mailbox (default), every folder of the account, or every account',
+        ),
+      mailbox: z
+        .string()
+        .default('INBOX')
+        .describe('Mailbox path (default: INBOX). Ignored unless scope is "mailbox"'),
       page: z.coerce.number().int().min(1).default(1).describe('Page number'),
       pageSize: z.coerce.number().int().min(1).max(100).default(20).describe('Results per page'),
       to: z.string().optional().describe('Filter by recipient address'),
@@ -525,17 +564,38 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
     { readOnlyHint: true, destructiveHint: false },
     async (params) => {
       try {
-        const result = await imapService.searchEmails(params.account, params.query ?? '', {
-          mailbox: params.mailbox,
+        const wideOptions = {
           page: params.page,
           pageSize: params.pageSize,
           to: params.to,
-          hasAttachment: params.has_attachment,
           largerThan: params.larger_than,
           smallerThan: params.smaller_than,
           answered: params.answered,
           preview: params.preview,
-        });
+        };
+
+        let result: PaginatedResult<EmailMeta>;
+        if (params.scope === 'mailbox') {
+          if (!params.account) {
+            throw new Error('account is required unless scope is "all_accounts"');
+          }
+          result = await imapService.searchEmails(params.account, params.query ?? '', {
+            ...wideOptions,
+            mailbox: params.mailbox,
+            hasAttachment: params.has_attachment,
+          });
+        } else if (params.scope === 'all_accounts') {
+          result = await imapService.searchAcross('all', params.query ?? '', wideOptions);
+        } else {
+          if (!params.account) {
+            throw new Error('account is required unless scope is "all_accounts"');
+          }
+          result = await imapService.searchAcross(
+            [params.account],
+            params.query ?? '',
+            wideOptions,
+          );
+        }
 
         if (result.items.length === 0) {
           return {
@@ -551,9 +611,30 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
         }
 
         const queryLabel = params.query ? `"${params.query}"` : 'filters';
+        const where =
+          params.scope === 'mailbox' ? params.mailbox : `scope: ${params.scope.replace('_', ' ')}`;
+        // Naming what did not finish matters more than the count: without it a
+        // partial answer is indistinguishable from an empty one.
+        const skipped = result.incompleteSources ?? [];
+        const andMore = skipped.length > 5 ? ` and ${skipped.length - 5} more` : '';
+        const partial =
+          skipped.length > 0
+            ? `\n⚠️ Incomplete — these did not finish in time and were skipped: ${skipped
+                .slice(0, 5)
+                .join(', ')}${andMore}. Narrow the scope, or search those folders directly.`
+            : '';
+        const noBody = result.bodyNotSearched ?? [];
+        const headersOnly =
+          noBody.length > 0
+            ? `\nℹ️ Only subjects, senders and recipients were searched in these folders, which are large enough that scanning their bodies would have cost more than the rest of the search put together: ${noBody
+                .slice(0, 5)
+                .join(
+                  ', ',
+                )}${noBody.length > 5 ? ` and ${noBody.length - 5} more` : ''}. Message bodies were searched everywhere else. Use scope "mailbox" on one of these to search its bodies.`
+            : '';
         const header =
-          `🔍 [${params.mailbox}] ${result.total} result(s) for ${queryLabel} ` +
-          `(page ${result.page}/${Math.ceil(result.total / result.pageSize)})\n`;
+          `🔍 [${where}] ${formatResultCount(result)} result(s) for ${queryLabel}` +
+          `${result.hasMore ? ' — more pages available' : ''}${partial}${headersOnly}\n`;
         const emails = result.items.map(formatEmailMeta).join('\n\n');
 
         return {

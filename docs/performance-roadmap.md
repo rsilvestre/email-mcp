@@ -1,7 +1,7 @@
 # Performance Improvements Roadmap
 
-> **Status**: Planning  
-> **Last Updated**: 2026-02-18
+> **Status**: Partly delivered — see *Delivered* below  
+> **Last Updated**: 2026-09-09
 
 Performance for an Email MCP server operates across **three distinct layers**, each with different bottlenecks and optimization strategies. This roadmap identifies concrete improvements against the current implementation, ordered by impact.
 
@@ -12,6 +12,57 @@ Performance for an Email MCP server operates across **three distinct layers**, e
 > Therefore, **response shaping** (returning only what the AI needs, in the most compact form) is the #1 performance technique.
 
 ---
+
+## Delivered
+
+Measured on two live Gmail accounts (~2500 messages each) with
+`pnpm bench`, comparing IMAP **commands issued** before and after. Command
+counts are deterministic. Wall-clock times are not: across ten runs, scenarios
+whose command count and byte count never changed produced medians spanning 3×
+to 14×. No claim here rests on a duration.
+
+| Change | Effect |
+|---|---|
+| Body fetched by MIME part instead of `BODY.PEEK[]` | `get_email` 5 → 2 commands. A message with 4 PDFs stopped transferring 4.6 MB to display 1.8 KB of text. |
+| `find_email_folder` stops at the first match, likely folders first | 45 → 4 commands |
+| Attachment filter resolved in growing batches | Dense mailbox: same 3 commands, 82% fewer bytes, 1687 → 363 ms. Sparse mailbox: 3 → 4 commands, 25% fewer bytes, 1457 → 1270 ms. |
+| Thread header searches OR'd together | 3 searches per Message-ID → 3 in total |
+| Idle connections probed before reuse | Removes the stall-then-succeed-on-retry pattern |
+| Concurrent connection setup deduplicated | Stops leaking unreferenced open sockets |
+| `email://{account}/stats` uses STATUS + one SEARCH | Was a full envelope scan of the period, behind a comment claiming otherwise |
+| Connections pooled, work spread across them | `get_emails` over 20 ids: 11.9 s → 5.7 s on Gmail. `list_mailboxes`: 4.9 s → 1.5 s. |
+| Spare connections closed once idle | Keeps the pool's cost from landing on unrelated sequential work |
+
+**Caution learned from measuring.** Batching the attachment filter at a fixed
+200 UIDs made the sparse case *worse* — 3 commands and 1457 ms became 8 and
+2250 ms on the account where attachments are rare — while clearly improving the
+dense one. Growing the batches geometrically brought it to 4 commands and
+1270 ms: one round trip more than before, for a quarter fewer bytes. A change
+that trades bytes for round trips has to be measured on both shapes of mailbox
+before it can be called a win, and the honest result here is a modest gain, not
+the large one the dense case suggested.
+
+**The largest single win came from asking what the server could already do.**
+Capabilities were being ignored entirely. LIST-STATUS turned listing folders
+from 27 commands into 2. X-GM-THRID replaced three header searches per thread
+with one. Gmail's All Mail folder made cross-folder search a single indexed
+query — 459 ms across 147 labels, faster than the one-folder search it
+replaces. None of that needed a local index, and an index would have been
+slower and staler. Read the CAPABILITY line before designing around its absence.
+
+**A second caution, from the pool.** Opening three connections made the fan-out
+paths two to three times faster and made an unrelated *sequential* listing 30%
+slower — reproducibly, with an unchanged command count, on a path that never
+uses the pool. Re-running with `MCP_EMAIL_IMAP_POOL_SIZE=1` restored the old
+timing and pinned the cause on the open connections themselves: a server shares
+an account's throughput across them. Spares are now closed once idle. The cost
+of a connection does not stop when you stop using it.
+
+**Measure before claiming anything.** Gmail negotiates `COMPRESS=DEFLATE`, and
+the deflate dictionary stays warm for the life of the connection, so repeating
+a request costs almost nothing on the wire regardless of payload. An early run
+here reported a 25000× byte reduction that was an artefact of exactly that.
+`pnpm bench` disables compression for this reason; see `scripts/bench/README.md`.
 
 ## Current State Assessment
 
@@ -32,6 +83,16 @@ Performance for an Email MCP server operates across **three distinct layers**, e
 | Contact extraction cap | ✅ Done | Caps at 500 recent messages for contact extraction |
 | Rate limiting (sends) | ✅ Done | `rate-limiter.ts` — token-bucket, 10/min/account |
 | Graceful shutdown | ✅ Done | `manager.ts` — `closeAll()` closes all connections |
+| Selective MIME part fetching | ✅ Done | `imap.service.ts` — `findBodyTextParts` picks the body part; no full-source download |
+| Idle connection probing | ✅ Done | `manager.ts` — NOOP with a bounded timeout past `MCP_EMAIL_IMAP_IDLE_PROBE_MS` |
+| Connection setup deduplication | ✅ Done | `manager.ts` — concurrent callers join one attempt |
+| Early exit in folder lookup | ✅ Done | `imap.service.ts` — `findEmailFolder` stops at the first match |
+| Bounded thread reconstruction | ✅ Done | `imap.service.ts` — `searchHeaderAnyOf` ORs the header terms |
+| Repeatable measurement | ✅ Done | `scripts/bench/` — commands and payload bytes per scenario |
+| IMAP connection pooling | ✅ Done | `manager.ts` + `pooled-connection.ts` — `withImapClient` spreads concurrent work; spares reaped when idle |
+| Folder counters via LIST-STATUS | ✅ Done | `imap.service.ts` — 27 commands to 2 where the server offers it |
+| Server-side threading | ✅ Done | `imap.service.ts` — X-GM-THRID replaces three header searches |
+| Cross-folder / cross-account search | ✅ Done | `searchAcross` — All Mail on Gmail, deadline-bounded fan-out elsewhere |
 
 ### What's Missing ❌
 
@@ -39,14 +100,12 @@ Performance for an Email MCP server operates across **three distinct layers**, e
 |-----|-----------------|--------|
 | Conservative SMTP pool defaults | Pooling defaults to `max_connections=1`, `max_messages=100` | Low — tune for high-throughput workloads |
 | No ENVELOPE/BODYSTRUCTURE cache | Fresh SEARCH + FETCH every request | High — repeat listings pay full IMAP cost |
-| Client-side pagination | Fetches ALL matching UIDs, slices in memory | High — 10K-mailbox fetches all UIDs just to show page 1 |
+| Client-side pagination | `UID SEARCH ALL` returns every UID, sliced in memory | Open — the attachment filter no longer scans everything, but the UID list itself is still fetched whole |
+| Cross-folder search on a server with no index | Folder-by-folder, deadline-bounded, headers only | Partly open — a local index is the only real fix, and only for such servers |
 | No IMAP command pipelining control | Relies on ImapFlow auto-pipelining (good) but fetches extra data | Low — ImapFlow handles this well already |
-| No selective MIME part fetching | Full source download for `getEmail()` | Medium — downloads HTML+attachments when only plain text needed |
 | No signature/quote stripping | Returns full body including signatures and quoted replies | Medium — wastes tokens on repeated content |
 | No IMAP IDLE for push | Only poll-based; no real-time arrival notifications | Low — not critical for MCP request/response model |
-| No connection keepalive (NOOP) | Connections may timeout during idle periods | Low-Medium — ImapFlow may handle internally |
 | No batch flag operations | One-at-a-time for mark/move/delete | Low — current usage patterns are single-message |
-| `has_attachment` filter is client-side | Post-filter after SEARCH (IMAP limitation) | Low — unavoidable IMAP protocol limitation |
 
 ---
 

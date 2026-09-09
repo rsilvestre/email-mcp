@@ -53,6 +53,7 @@ export const AccountConfigSchema = z
     password_command: z.string().min(1, 'password_command cannot be empty').optional(),
     oauth2: OAuth2ConfigSchema.optional(),
     sent_mailbox: z.string().optional(),
+    imap_pool_size: z.coerce.number().int().min(1).max(20).optional(),
     save_to_sent: z.boolean().optional(),
     imap: ImapConfigSchema,
     smtp: SmtpConfigSchema,

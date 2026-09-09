@@ -2,6 +2,7 @@ import {
   buildPreview,
   decodeCharset,
   decodeTransferEncoding,
+  findBodyTextParts,
   findPreviewPart,
   PREVIEW_LENGTH,
   stripHtml,
@@ -288,5 +289,117 @@ describe('buildPreview', () => {
     };
 
     expect(buildPreview(raw, latin)).toBe('café au lait');
+  });
+});
+
+describe('findBodyTextParts', () => {
+  it('reads a single-part text message from section 1', () => {
+    const parts = findBodyTextParts({
+      type: 'text/plain',
+      encoding: '7bit',
+      parameters: { charset: 'utf-8' },
+    });
+
+    expect(parts.plain).toEqual({
+      key: '1',
+      type: 'text/plain',
+      encoding: '7bit',
+      charset: 'utf-8',
+    });
+    expect(parts.html).toBeUndefined();
+  });
+
+  it('finds both alternatives of a multipart/alternative', () => {
+    const parts = findBodyTextParts({
+      type: 'multipart/alternative',
+      childNodes: [
+        { part: '1', type: 'text/plain', encoding: 'quoted-printable' },
+        { part: '2', type: 'text/html', encoding: 'base64' },
+      ],
+    });
+
+    expect(parts.plain?.key).toBe('1');
+    expect(parts.html?.key).toBe('2');
+  });
+
+  it('finds the body of a multipart/mixed beside its attachment', () => {
+    const parts = findBodyTextParts({
+      type: 'multipart/mixed',
+      childNodes: [
+        { part: '1', type: 'text/plain', encoding: '8bit' },
+        { part: '2', type: 'application/pdf', disposition: 'attachment' },
+      ],
+    });
+
+    expect(parts.plain?.key).toBe('1');
+    expect(parts.html).toBeUndefined();
+  });
+
+  it('descends into a nested multipart to reach the body', () => {
+    const parts = findBodyTextParts({
+      type: 'multipart/mixed',
+      childNodes: [
+        {
+          part: '1',
+          type: 'multipart/alternative',
+          childNodes: [
+            { part: '1.1', type: 'text/plain', encoding: '8bit' },
+            { part: '1.2', type: 'text/html', encoding: '8bit' },
+          ],
+        },
+        { part: '2', type: 'image/png', disposition: 'attachment' },
+      ],
+    });
+
+    expect(parts.plain?.key).toBe('1.1');
+    expect(parts.html?.key).toBe('1.2');
+  });
+
+  // An attached .txt or .html is a file the caller downloads by name. Treating
+  // it as the body would replace the message text with the attachment's.
+  it('ignores a text part attached as a file', () => {
+    const parts = findBodyTextParts({
+      type: 'multipart/mixed',
+      childNodes: [
+        { part: '1', type: 'text/plain', encoding: '8bit' },
+        { part: '2', type: 'text/plain', encoding: 'base64', disposition: 'attachment' },
+        { part: '3', type: 'text/html', encoding: 'base64', disposition: 'attachment' },
+      ],
+    });
+
+    expect(parts.plain?.key).toBe('1');
+    expect(parts.html).toBeUndefined();
+  });
+
+  it('carries the encoding and charset needed to decode the part', () => {
+    const parts = findBodyTextParts({
+      type: 'multipart/alternative',
+      childNodes: [
+        {
+          part: '1',
+          type: 'text/plain',
+          encoding: 'base64',
+          parameters: { charset: 'iso-8859-1' },
+        },
+      ],
+    });
+
+    expect(parts.plain?.encoding).toBe('base64');
+    expect(parts.plain?.charset).toBe('iso-8859-1');
+  });
+
+  it('returns nothing for a message with no text part at all', () => {
+    const parts = findBodyTextParts({
+      type: 'multipart/mixed',
+      childNodes: [{ part: '1', type: 'application/pdf', disposition: 'attachment' }],
+    });
+
+    expect(parts.plain).toBeUndefined();
+    expect(parts.html).toBeUndefined();
+  });
+
+  it('tolerates a missing or malformed body structure', () => {
+    expect(findBodyTextParts(undefined)).toEqual({});
+    expect(findBodyTextParts('not a structure')).toEqual({});
   });
 });
