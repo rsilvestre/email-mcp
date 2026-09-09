@@ -29,6 +29,8 @@ between runs and are not the basis for any claim here.
 | Idle connections probed before reuse | Removes the stall-then-succeed-on-retry pattern |
 | Concurrent connection setup deduplicated | Stops leaking unreferenced open sockets |
 | `email://{account}/stats` uses STATUS + one SEARCH | Was a full envelope scan of the period, behind a comment claiming otherwise |
+| Connections pooled, work spread across them | `get_emails` over 20 ids: 11.9 s → 5.7 s on Gmail. `list_mailboxes`: 4.9 s → 1.5 s. |
+| Spare connections closed once idle | Keeps the pool's cost from landing on unrelated sequential work |
 
 **Caution learned from measuring.** Batching the attachment filter at a fixed
 200 UIDs made the sparse case *worse* — 3 commands and 1457 ms became 8 and
@@ -38,6 +40,14 @@ dense one. Growing the batches geometrically brought it to 4 commands and
 that trades bytes for round trips has to be measured on both shapes of mailbox
 before it can be called a win, and the honest result here is a modest gain, not
 the large one the dense case suggested.
+
+**A second caution, from the pool.** Opening three connections made the fan-out
+paths two to three times faster and made an unrelated *sequential* listing 30%
+slower — reproducibly, with an unchanged command count, on a path that never
+uses the pool. Re-running with `MCP_EMAIL_IMAP_POOL_SIZE=1` restored the old
+timing and pinned the cause on the open connections themselves: a server shares
+an account's throughput across them. Spares are now closed once idle. The cost
+of a connection does not stop when you stop using it.
 
 **Measure before claiming anything.** Gmail negotiates `COMPRESS=DEFLATE`, and
 the deflate dictionary stays warm for the life of the connection, so repeating
@@ -70,6 +80,7 @@ here reported a 25000× byte reduction that was an artefact of exactly that.
 | Early exit in folder lookup | ✅ Done | `imap.service.ts` — `findEmailFolder` stops at the first match |
 | Bounded thread reconstruction | ✅ Done | `imap.service.ts` — `searchHeaderAnyOf` ORs the header terms |
 | Repeatable measurement | ✅ Done | `scripts/bench/` — commands and payload bytes per scenario |
+| IMAP connection pooling | ✅ Done | `manager.ts` + `pooled-connection.ts` — `withImapClient` spreads concurrent work; spares reaped when idle |
 
 ### What's Missing ❌
 
@@ -78,6 +89,7 @@ here reported a 25000× byte reduction that was an artefact of exactly that.
 | Conservative SMTP pool defaults | Pooling defaults to `max_connections=1`, `max_messages=100` | Low — tune for high-throughput workloads |
 | No ENVELOPE/BODYSTRUCTURE cache | Fresh SEARCH + FETCH every request | High — repeat listings pay full IMAP cost |
 | Client-side pagination | `UID SEARCH ALL` returns every UID, sliced in memory | Open — the attachment filter no longer scans everything, but the UID list itself is still fetched whole |
+| No cross-folder or cross-account search | `searchEmails` is single folder, single account | Open — the main gap a local index would close |
 | No IMAP command pipelining control | Relies on ImapFlow auto-pipelining (good) but fetches extra data | Low — ImapFlow handles this well already |
 | No signature/quote stripping | Returns full body including signatures and quoted replies | Medium — wastes tokens on repeated content |
 | No IMAP IDLE for push | Only poll-based; no real-time arrival notifications | Low — not critical for MCP request/response model |
