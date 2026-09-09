@@ -495,13 +495,23 @@ export default class ImapService {
   // Mailboxes
   // -------------------------------------------------------------------------
 
-  async listMailboxes(accountName: string): Promise<Mailbox[]> {
+  /**
+   * List an account's folders, with message counts where they are affordable.
+   *
+   * A server offering LIST-STATUS returns the counters inline with the listing,
+   * so they cost nothing and are always included. Without it each folder needs
+   * its own STATUS round trip — measured at 6 seconds on a 309-folder account,
+   * to display numbers a caller looking for a folder name rarely reads. There
+   * they are omitted unless asked for.
+   */
+  async listMailboxes(
+    accountName: string,
+    options: { includeCounts?: boolean } = {},
+  ): Promise<Mailbox[]> {
     const client = await this.connections.getImapClient(accountName);
+    const inlineCounts = client.capabilities.has('LIST-STATUS');
 
-    // LIST-STATUS (RFC 5819) returns every folder's counters inline with the
-    // folder list, turning what was LIST plus one STATUS per folder into a
-    // single command. Gmail advertises it; a plain Dovecot may not.
-    if (client.capabilities.has('LIST-STATUS')) {
+    if (inlineCounts) {
       const listed = await client.list({ statusQuery: MAILBOX_STATUS_FIELDS });
       return listed.map((mb) => ({
         name: mb.name,
@@ -512,36 +522,34 @@ export default class ImapService {
       }));
     }
 
-    // Without the extension it is one STATUS per folder. Issued through the
-    // pool so they genuinely overlap — imapflow's own fallback would run them
-    // in turn on a single connection.
     const mailboxes = await client.list();
+    const bare = mailboxes.map((mb) => ({
+      name: mb.name,
+      path: mb.path,
+      specialUse: mb.specialUse ?? undefined,
+    }));
+
+    // Default off here: the counts are what make this call expensive, and the
+    // caller is usually after folder names.
+    if (options.includeCounts !== true) return bare;
+
+    // One STATUS per folder, spread across the pool so they genuinely overlap —
+    // imapflow's own fallback would run them in turn on a single connection.
     const statusResults = await Promise.allSettled(
       mailboxes.map(async (mb) => {
         const readStatus = async (c: ImapFlow) => c.status(mb.path, MAILBOX_STATUS_FIELDS);
-        const status = await this.connections.withImapClient(accountName, readStatus);
-        return {
-          name: mb.name,
-          path: mb.path,
-          specialUse: mb.specialUse ?? undefined,
-          totalMessages: status.messages ?? 0,
-          unseenMessages: status.unseen ?? 0,
-        };
+        return this.connections.withImapClient(accountName, readStatus);
       }),
     );
 
-    return statusResults.map((result, idx) => {
-      if (result.status === 'fulfilled') {
-        return result.value;
-      }
-      // Fallback for folders that don't support STATUS (e.g. \Noselect)
-      const mb = mailboxes[idx];
+    return bare.map((mb, idx) => {
+      const result = statusResults[idx];
+      // A folder that refuses STATUS keeps its name and loses only its counts.
+      if (result?.status !== 'fulfilled') return mb;
       return {
-        name: mb.name,
-        path: mb.path,
-        specialUse: mb.specialUse ?? undefined,
-        totalMessages: 0,
-        unseenMessages: 0,
+        ...mb,
+        totalMessages: result.value.messages ?? 0,
+        unseenMessages: result.value.unseen ?? 0,
       };
     });
   }
@@ -1146,6 +1154,14 @@ export default class ImapService {
       answered?: boolean;
       /** Fetch and decode a short body preview. Costs extra bytes per message. */
       preview?: boolean;
+      /**
+       * Search message bodies as well as headers. On by default.
+       *
+       * This is the expensive half on a server with no full-text index, which
+       * has to scan each message: a 1611-message folder measured 6.7 s with
+       * bodies against about 0.3 s without.
+       */
+      searchBody?: boolean;
     } = {},
   ): Promise<PaginatedResult<EmailMeta>> {
     const client = await this.connections.getImapClient(accountName);
@@ -1156,7 +1172,11 @@ export default class ImapService {
 
     const lock = await client.getMailboxLock(mailbox);
     try {
-      const searchCriteria = ImapService.buildSearchCriteria(sanitizedQuery, options);
+      const searchCriteria = ImapService.buildSearchCriteria(
+        sanitizedQuery,
+        options,
+        options.searchBody !== false,
+      );
 
       const searchResult = await client.search(searchCriteria, { uid: true });
       const uids: number[] = Array.isArray(searchResult) ? searchResult : [];
