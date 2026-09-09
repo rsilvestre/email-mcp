@@ -791,3 +791,133 @@ describe('ImapService.getMailboxSnapshot', () => {
     expect(client._releaseFn).toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// getThread
+// ---------------------------------------------------------------------------
+
+describe('ImapService.getThread', () => {
+  let client: ReturnType<typeof createMockImapClient>;
+  let service: ImapService;
+
+  /** Every SEARCH criteria the service issued. */
+  let searchCriteria: Record<string, unknown>[];
+
+  /** Count the Message-IDs a criteria object covers, OR chain included. */
+  function valuesIn(criteria: Record<string, unknown>): string[] {
+    if (Array.isArray(criteria.or)) {
+      return (criteria.or as Record<string, unknown>[]).flatMap(valuesIn);
+    }
+    const header = criteria.header as Record<string, string> | undefined;
+    return header ? Object.values(header) : [];
+  }
+
+  beforeEach(() => {
+    client = createMockImapClient();
+    service = new ImapService(createMockConnectionManager(client));
+    searchCriteria = [];
+
+    client.search.mockImplementation(async (criteria: Record<string, unknown>) => {
+      searchCriteria.push(criteria);
+      return [1];
+    });
+    client.fetchOne.mockResolvedValue({
+      uid: 1,
+      envelope: { messageId: '<root@x>', inReplyTo: '<parent@x>' },
+      headers: Buffer.from('References: <a@x> <b@x> <c@x> <d@x>\r\n'),
+    });
+    client.fetch.mockImplementation(() => {
+      async function* messages() {
+        yield {
+          uid: 1,
+          envelope: {
+            messageId: '<root@x>',
+            date: '2026-01-01',
+            from: [],
+            to: [],
+            cc: [],
+            bcc: [],
+          },
+          flags: new Set<string>(),
+          bodyStructure: { type: 'text/plain' },
+          headers: Buffer.from('Subject: fil\r\n'),
+        };
+      }
+      return messages();
+    });
+    client.download.mockResolvedValue(undefined);
+  });
+
+  it('issues a bounded number of searches regardless of thread length', async () => {
+    await service.getThread('test', '<root@x>', 'INBOX');
+
+    // One lookup for the root, then one per header name across all
+    // Message-IDs — not three per Message-ID as before.
+    expect(searchCriteria).toHaveLength(4);
+  });
+
+  it('covers every collected Message-ID in the OR chain', async () => {
+    await service.getThread('test', '<root@x>', 'INBOX');
+
+    // Root lookup first, then the three header searches.
+    const covered = new Set(searchCriteria.slice(1).flatMap(valuesIn));
+    ['<root@x>', '<parent@x>', '<a@x>', '<b@x>', '<c@x>', '<d@x>'].forEach((id) => {
+      expect(covered.has(id)).toBe(true);
+    });
+  });
+
+  it('searches Message-ID, References and In-Reply-To', async () => {
+    await service.getThread('test', '<root@x>', 'INBOX');
+
+    const headerNames = searchCriteria.slice(1).map((criteria) => {
+      const first = Array.isArray(criteria.or)
+        ? (criteria.or[0] as Record<string, unknown>)
+        : criteria;
+      return Object.keys(first.header as Record<string, string>)[0];
+    });
+    expect(new Set(headerNames)).toEqual(new Set(['Message-ID', 'References', 'In-Reply-To']));
+  });
+
+  it('reads the root References from headers rather than the full source', async () => {
+    await service.getThread('test', '<root@x>', 'INBOX');
+
+    const rootFetchOptions = client.fetchOne.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(rootFetchOptions.source).toBeUndefined();
+    expect(rootFetchOptions.headers).toBe(true);
+  });
+
+  it('returns an empty thread when nothing matches', async () => {
+    client.search.mockResolvedValue([]);
+    client.fetchOne.mockResolvedValue(undefined);
+
+    const thread = await service.getThread('test', '<absent@x>', 'INBOX');
+
+    expect(thread.messageCount).toBe(0);
+    expect(thread.messages).toEqual([]);
+  });
+
+  // Pre-existing inconsistency, documented rather than changed here: the three
+  // header searches tolerate a server that cannot do them, but the root lookup
+  // that precedes them propagates. Making those agree is a behaviour change,
+  // not a performance one.
+  it('propagates a rejected root header search', async () => {
+    client.search.mockRejectedValue(new Error('NO [CANNOT] Header search unsupported'));
+
+    await expect(service.getThread('test', '<root@x>', 'INBOX')).rejects.toThrow(
+      'Header search unsupported',
+    );
+  });
+
+  it('tolerates a server that rejects the thread header searches', async () => {
+    let callCount = 0;
+    client.search.mockImplementation(async () => {
+      callCount += 1;
+      if (callCount === 1) return [1];
+      throw new Error('NO [CANNOT] Header search unsupported');
+    });
+
+    const thread = await service.getThread('test', '<root@x>', 'INBOX');
+
+    expect(thread.messageCount).toBe(0);
+  });
+});

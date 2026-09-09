@@ -1628,6 +1628,44 @@ export default class ImapService {
   }
 
   /**
+   * Search one header against many values in as few commands as possible.
+   *
+   * One SEARCH per Message-ID was the dominant cost of building a thread:
+   * header SEARCH is typically an unindexed server-side scan, and a thread of
+   * twenty references issued sixty of them in sequence. IMAP can OR the terms
+   * into a single command instead.
+   *
+   * The OR chain is still chunked: imapflow nests OR pairwise, so an unbounded
+   * list produces a deeply nested command that some servers reject outright.
+   */
+  private static async searchHeaderAnyOf(
+    client: ImapFlow,
+    headerName: string,
+    values: string[],
+  ): Promise<number[]> {
+    const CHUNK = 25;
+    const found: number[] = [];
+
+    for (let offset = 0; offset < values.length; offset += CHUNK) {
+      const chunk = values.slice(offset, offset + CHUNK);
+      const criteria =
+        chunk.length === 1
+          ? { header: { [headerName]: chunk[0] } }
+          : { or: chunk.map((value) => ({ header: { [headerName]: value } })) };
+
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const result = await client.search(criteria, { uid: true });
+        if (Array.isArray(result)) found.push(...result);
+      } catch {
+        // Header search is not supported everywhere; a miss is not an error.
+      }
+    }
+
+    return found;
+  }
+
+  /**
    * Reconstruct an email thread by following References / In-Reply-To chains.
    * Searches by Message-ID header for each reference and returns messages in
    * chronological order. Caps at MAX_THREAD_MESSAGES to prevent runaway chains.
@@ -1685,55 +1723,16 @@ export default class ImapService {
         }
       }
 
-      // Search for all related messages by Message-ID
-      const foundUids = new Set<number>();
-      // eslint-disable-next-line no-restricted-syntax
-      for (const msgId of targetMsgIds) {
-        if (foundUids.size >= MAX_THREAD_MESSAGES) break;
-
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          const searchResult = await client.search(
-            { header: { 'Message-ID': msgId } },
-            { uid: true },
-          );
-          if (Array.isArray(searchResult)) {
-            searchResult.forEach((uid) => {
-              foundUids.add(uid);
-            });
-          }
-        } catch {
-          // Header search may not be supported for all messages
-        }
-      }
-
-      // Also search for messages that reference any of our Message-IDs
-      // eslint-disable-next-line no-restricted-syntax
-      for (const msgId of targetMsgIds) {
-        if (foundUids.size >= MAX_THREAD_MESSAGES) break;
-
-        try {
-          // eslint-disable-next-line no-await-in-loop
-          const refSearch = await client.search({ header: { References: msgId } }, { uid: true });
-          if (Array.isArray(refSearch)) {
-            refSearch.forEach((uid) => {
-              foundUids.add(uid);
-            });
-          }
-          // eslint-disable-next-line no-await-in-loop
-          const replySearch = await client.search(
-            { header: { 'In-Reply-To': msgId } },
-            { uid: true },
-          );
-          if (Array.isArray(replySearch)) {
-            replySearch.forEach((uid) => {
-              foundUids.add(uid);
-            });
-          }
-        } catch {
-          // Header search may fail on some servers
-        }
-      }
+      // Find the messages of the thread: those carrying one of the collected
+      // Message-IDs, and those replying to one. Three OR'd searches rather than
+      // three per Message-ID.
+      const wantedIds = Array.from(targetMsgIds);
+      const matchedUidGroups = await Promise.all([
+        ImapService.searchHeaderAnyOf(client, 'Message-ID', wantedIds),
+        ImapService.searchHeaderAnyOf(client, 'References', wantedIds),
+        ImapService.searchHeaderAnyOf(client, 'In-Reply-To', wantedIds),
+      ]);
+      const foundUids = new Set<number>(matchedUidGroups.flat());
 
       if (foundUids.size === 0) {
         return {
