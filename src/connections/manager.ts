@@ -24,6 +24,9 @@ type SmtpAuth =
 export default class ConnectionManager implements IConnectionManager {
   private imapClients = new Map<string, ImapFlow>();
 
+  /** Connections currently being opened, so concurrent callers join one attempt. */
+  private imapClientsConnecting = new Map<string, Promise<ImapFlow>>();
+
   private smtpTransports = new Map<string, Transporter>();
 
   private accounts = new Map<string, AccountConfig>();
@@ -84,11 +87,34 @@ export default class ConnectionManager implements IConnectionManager {
       return existing;
     }
 
-    // Clean up stale connection
-    if (existing) {
+    // A connection for this account may already be opening. Join that attempt
+    // instead of starting a second one: without this, concurrent first calls
+    // (get_emails fanning out over ids, check_health over accounts) each build
+    // an ImapFlow and call connect(), and only the last one written to the map
+    // is ever reachable — the others stay open, unreferenced, and are never
+    // logged out. Mirrors the labelStrategyPending pattern in ImapService.
+    const connecting = this.imapClientsConnecting.get(accountName);
+    if (connecting) {
+      return connecting;
+    }
+
+    const attempt = this.openImapClient(accountName, existing);
+    this.imapClientsConnecting.set(accountName, attempt);
+    try {
+      return await attempt;
+    } finally {
+      // Cleared on failure too, so the next call retries rather than joining a
+      // promise that has already rejected.
+      this.imapClientsConnecting.delete(accountName);
+    }
+  }
+
+  /** Build, connect and cache a fresh IMAP client, discarding any stale one. */
+  private async openImapClient(accountName: string, staleClient?: ImapFlow): Promise<ImapFlow> {
+    if (staleClient) {
       this.imapClients.delete(accountName);
       try {
-        existing.close();
+        staleClient.close();
       } catch {
         /* ignore */
       }
