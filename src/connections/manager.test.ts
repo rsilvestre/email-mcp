@@ -366,3 +366,96 @@ describe('ConnectionManager IMAP pooling', () => {
     expect(loggedOut).toHaveLength(imapInstances.length);
   });
 });
+
+describe('ConnectionManager spare connection reaping', () => {
+  const IDLE_THRESHOLD_MS = 60_000;
+
+  function deferred() {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { held, release };
+  }
+
+  /** Open the pool up to its ceiling with one burst of concurrent work. */
+  async function fillPool(manager: ConnectionManager) {
+    const gate = deferred();
+    const tasks = Array.from({ length: 20 }, async () =>
+      manager.withImapClient('test', async () => gate.held),
+    );
+    await Promise.resolve();
+    gate.release();
+    await Promise.all(tasks);
+  }
+
+  beforeEach(() => {
+    imapInstances.length = 0;
+    imapControl.failNextConnectCount = 0;
+    imapControl.probeBehaviour = 'ok';
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('closes spare connections once they have gone quiet', async () => {
+    const manager = new ConnectionManager([account]);
+    await fillPool(manager);
+    expect(imapInstances).toHaveLength(3);
+
+    await vi.advanceTimersByTimeAsync(IDLE_THRESHOLD_MS + 1_000);
+    await manager.withImapClient('test', async () => undefined);
+
+    // Extra sockets are not free after the burst: a server shares an account's
+    // throughput across them, which measurably slowed unrelated sequential
+    // work. The steady state should be one connection.
+    const loggedOut = imapInstances.filter((client) => client.logout.mock.calls.length > 0);
+    expect(loggedOut).toHaveLength(2);
+  });
+
+  it('keeps the connection everything else uses', async () => {
+    const manager = new ConnectionManager([account]);
+    await fillPool(manager);
+    const primary = imapInstances[0];
+
+    await vi.advanceTimersByTimeAsync(IDLE_THRESHOLD_MS + 1_000);
+    await manager.getImapClient('test');
+
+    expect(primary?.logout).not.toHaveBeenCalled();
+    // Reaping must not cost a reconnection.
+    expect(imapInstances).toHaveLength(3);
+  });
+
+  it('leaves spares alone while they are still working', async () => {
+    const manager = new ConnectionManager([account]);
+    await fillPool(manager);
+
+    const gate = deferred();
+    const busy = Array.from({ length: 20 }, async () =>
+      manager.withImapClient('test', async () => gate.held),
+    );
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(IDLE_THRESHOLD_MS + 1_000);
+    await manager.getImapClient('test');
+
+    const loggedOut = imapInstances.filter((client) => client.logout.mock.calls.length > 0);
+    expect(loggedOut).toHaveLength(0);
+
+    gate.release();
+    await Promise.all(busy);
+  });
+
+  it('opens spares again for the next burst', async () => {
+    const manager = new ConnectionManager([account]);
+    await fillPool(manager);
+
+    await vi.advanceTimersByTimeAsync(IDLE_THRESHOLD_MS + 1_000);
+    await manager.withImapClient('test', async () => undefined);
+    await fillPool(manager);
+
+    // Reaped connections are replaced by new ones, not resurrected.
+    expect(imapInstances.length).toBeGreaterThan(3);
+  });
+});

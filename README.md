@@ -527,9 +527,12 @@ use at once. imapflow runs commands on a connection one at a time, so tools
 that fan out — reading twenty messages, or listing folders with their unread
 counts — otherwise run single file no matter how they are written. Extra
 connections open only while work is actually waiting, never for sequential
-calls, and are closed at shutdown. Lower it to `1` for a server with a tight
-per-account connection limit; that restores the older, fully sequential
-behaviour.
+calls, and a spare that has been idle past the probe threshold is closed
+rather than probed — so an idle account settles back to a single connection.
+That reaping is deliberate: a server shares an account's throughput across its
+connections, and holding spares open measurably slowed unrelated sequential
+work. Lower the setting to `1` for a server with a tight per-account connection
+limit; that restores the older, fully sequential behaviour.
 
 `MCP_EMAIL_IMAP_DISABLE_COMPRESSION` exists for measurement. Compression is
 on by default and worth keeping: the only reason to turn it off is that the

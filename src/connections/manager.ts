@@ -169,7 +169,37 @@ export default class ConnectionManager implements IConnectionManager {
    * out a connection with no idea how long it will be used, and opening one per
    * sequential call would be pure cost.
    */
+  /**
+   * Close spare connections that have gone quiet.
+   *
+   * Extra sockets are not free once the burst that needed them is over: a
+   * server shares an account's throughput across its connections, and holding
+   * three open measurably slowed a byte-heavy sequential listing on Gmail — 30%
+   * on a path that never used the pool at all. Reaping brings the steady state
+   * back to one connection, so only genuinely concurrent work pays for the
+   * extras. The first connection is kept; it is the one everything else uses.
+   */
+  private reapIdleSpareConnections(accountName: string): void {
+    const pool = this.imapPools.get(accountName);
+    if (!pool || pool.length <= 1) return;
+
+    // Walk backwards: splicing while iterating forwards skips entries.
+    for (let index = pool.length - 1; index >= 1; index -= 1) {
+      const entry = pool[index];
+      if (entry?.inFlight === 0 && entry.isStale()) {
+        pool.splice(index, 1);
+        // Best-effort: a spare that fails to log out is being discarded anyway.
+        entry.ready
+          .then(async (client) => client.logout())
+          .catch(() => undefined)
+          .then(() => undefined);
+      }
+    }
+  }
+
   private selectImapConnection(accountName: string, allowGrowth: boolean): PooledImapConnection {
+    this.reapIdleSpareConnections(accountName);
+
     const pool = this.imapPools.get(accountName) ?? [];
     const leastLoaded = pool.reduce<PooledImapConnection | undefined>(
       (best, entry) => (best === undefined || entry.inFlight < best.inFlight ? entry : best),
