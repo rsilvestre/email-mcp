@@ -19,7 +19,7 @@ Each scenario reports three things. **Compare the command count**, not the clock
 |---|---|
 | **cmd** — IMAP commands issued | The metric of record. Deterministic run to run, so a drop is a real reduction in round trips. |
 | **octets lus** — bytes off the socket | Catches fetches that ask for too much (a whole message to show its text). |
-| médiane / p90 — wall clock | Context only. Network variance between runs is wide enough to hide a genuine regression, so never conclude from time alone. |
+| médiane / p90 — wall clock | Context only. See the noise floor below: never conclude from time alone. |
 
 Commands are counted by swapping in a counting logger on the `ImapFlow`
 instance: imapflow logs every compiled command it sends at `debug` with
@@ -40,6 +40,28 @@ any other way and it warns.
 
 Only the command *name* is recorded, never its arguments: search terms,
 Message-IDs and mailbox names would otherwise end up in a report file.
+
+## The noise floor
+
+Across ten runs of this benchmark against the same two accounts, scenarios whose
+command count never varied — always exactly 2 IMAP commands, always the same
+bytes — produced these medians:
+
+| Scenario | Medians observed (ms) | Spread |
+|---|---|---|
+| gmail / list_emails page 1 | 281 … 883 | ×3.1 |
+| gmail / list_emails secondary folder | 260 … 926 | ×3.6 |
+| gmail / search_emails | 267 … 896 | ×3.4 |
+| silvestre / search_emails | 81 … 1113 | ×13.7 |
+
+Identical work, same commands, same bytes, up to fourteen times the duration.
+Any timing change smaller than that is indistinguishable from the network, and
+reading one as an improvement or a regression is reading noise. This is why the
+command count is the metric of record and durations are reported as context.
+
+It cuts both ways: a real regression can hide inside that spread too. The
+attachment-filter regression was caught because the *command count* went from 3
+to 8, not because it got slower.
 
 ## Safety
 

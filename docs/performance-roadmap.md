@@ -17,8 +17,9 @@ Performance for an Email MCP server operates across **three distinct layers**, e
 
 Measured on two live Gmail accounts (~2500 messages each) with
 `pnpm bench`, comparing IMAP **commands issued** before and after. Command
-counts are deterministic; wall-clock times in the same runs varied by 2–3×
-between runs and are not the basis for any claim here.
+counts are deterministic. Wall-clock times are not: across ten runs, scenarios
+whose command count and byte count never changed produced medians spanning 3×
+to 14×. No claim here rests on a duration.
 
 | Change | Effect |
 |---|---|
