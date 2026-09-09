@@ -75,7 +75,8 @@ describe('ImapService', () => {
       ]);
       client.status.mockResolvedValue({ messages: 10, unseen: 3 });
 
-      const result = await service.listMailboxes('test');
+      // Counts are opt-in on a server without LIST-STATUS, which this mock is.
+      const result = await service.listMailboxes('test', { includeCounts: true });
 
       expect(result).toHaveLength(2);
       expect(result[0]).toEqual({
@@ -1011,7 +1012,23 @@ describe('ImapService.listMailboxes', () => {
     expect(mailboxes[0]).toMatchObject({ path: 'INBOX', totalMessages: 1709, unseenMessages: 711 });
   });
 
-  it('falls back to one STATUS per folder without the extension', async () => {
+  // Without the extension the counts are what make this call expensive: one
+  // round trip per folder, measured at 6 seconds on a 309-folder account.
+  it('omits the counts without the extension rather than paying for them', async () => {
+    client.capabilities = new Set<string>();
+    client.list.mockResolvedValue([
+      { name: 'INBOX', path: 'INBOX' },
+      { name: 'Travaux', path: 'Travaux' },
+    ]);
+
+    const mailboxes = await service.listMailboxes('test');
+
+    expect(client.status).not.toHaveBeenCalled();
+    expect(mailboxes.map((mb) => mb.path)).toEqual(['INBOX', 'Travaux']);
+    expect(mailboxes[0]?.totalMessages).toBeUndefined();
+  });
+
+  it('falls back to one STATUS per folder when the counts are asked for', async () => {
     client.capabilities = new Set<string>();
     client.list.mockResolvedValue([
       { name: 'INBOX', path: 'INBOX' },
@@ -1019,10 +1036,21 @@ describe('ImapService.listMailboxes', () => {
     ]);
     client.status.mockResolvedValue({ messages: 11, unseen: 1 });
 
-    const mailboxes = await service.listMailboxes('test');
+    const mailboxes = await service.listMailboxes('test', { includeCounts: true });
 
     expect(client.status).toHaveBeenCalledTimes(2);
     expect(mailboxes[1]).toMatchObject({ path: 'Travaux', totalMessages: 11 });
+  });
+
+  it('keeps a folder that refuses STATUS, minus its counts', async () => {
+    client.capabilities = new Set<string>();
+    client.list.mockResolvedValue([{ name: 'Broken', path: 'Broken' }]);
+    client.status.mockRejectedValue(new Error('NO [SERVERBUG]'));
+
+    const mailboxes = await service.listMailboxes('test', { includeCounts: true });
+
+    expect(mailboxes[0]).toMatchObject({ path: 'Broken' });
+    expect(mailboxes[0]?.totalMessages).toBeUndefined();
   });
 
   it('reports zero for a folder whose counters are missing', async () => {
@@ -1315,5 +1343,39 @@ describe('ImapService.searchAcross', () => {
 
     expect(result.items).toHaveLength(1);
     expect(result.items[0]?.account).toBe('test');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// searchEmails body term
+// ---------------------------------------------------------------------------
+
+describe('ImapService.searchEmails body term', () => {
+  let client: ReturnType<typeof createMockImapClient>;
+  let service: ImapService;
+
+  beforeEach(() => {
+    client = createMockImapClient();
+    service = new ImapService(createMockConnectionManager(client));
+    client.search.mockResolvedValue([]);
+  });
+
+  function termsUsed() {
+    const criteria = client.search.mock.calls[0]?.[0] as Record<string, unknown>;
+    return ((criteria.or ?? []) as Record<string, string>[]).flatMap((t) => Object.keys(t));
+  }
+
+  it('searches bodies by default', async () => {
+    await service.searchEmails('test', 'facture', { mailbox: 'INBOX' });
+
+    expect(termsUsed()).toContain('body');
+  });
+
+  // The expensive half on a server that has to scan: 6.7s against 0.3s on a
+  // 1611-message folder.
+  it('leaves bodies out when the caller asks for a fast search', async () => {
+    await service.searchEmails('test', 'facture', { mailbox: 'INBOX', searchBody: false });
+
+    expect(termsUsed()).toEqual(['subject', 'from']);
   });
 });

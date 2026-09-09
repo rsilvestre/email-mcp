@@ -554,6 +554,12 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
       larger_than: z.coerce.number().optional().describe('Minimum email size in KB'),
       smaller_than: z.coerce.number().optional().describe('Maximum email size in KB'),
       answered: z.boolean().optional().describe('Filter: true=replied, false=not replied'),
+      search_body: z
+        .boolean()
+        .optional()
+        .describe(
+          'Search message bodies as well as subjects and senders. On by default. This is the expensive half on a server with no full-text index, which scans every message: a 1611-message folder measured 6.7s with bodies against about 0.3s without. Set false for a fast search when the subject or sender is enough.',
+        ),
       preview: z
         .boolean()
         .default(false)
@@ -583,6 +589,7 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
             ...wideOptions,
             mailbox: params.mailbox,
             hasAttachment: params.has_attachment,
+            searchBody: params.search_body,
           });
         } else if (params.scope === 'all_accounts') {
           result = await imapService.searchAcross('all', params.query ?? '', wideOptions);

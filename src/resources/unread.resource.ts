@@ -34,13 +34,15 @@ export default function registerUnreadResource(
     { description: 'Unread email count summary by folder for an account' },
     async (uri, { account }) => {
       const accountName = account as string;
-      const mailboxes = await imapService.listMailboxes(accountName);
+      // This resource is the counts, so it asks for them even where that means
+      // a STATUS per folder.
+      const mailboxes = await imapService.listMailboxes(accountName, { includeCounts: true });
 
       const unreadFolders = mailboxes
-        .filter((mb) => mb.unseenMessages > 0)
+        .filter((mb) => (mb.unseenMessages ?? 0) > 0)
         .map((mb) => ({
           path: mb.path,
-          unread: mb.unseenMessages,
+          unread: mb.unseenMessages ?? 0,
         }));
 
       const totalUnread = unreadFolders.reduce((sum, f) => sum + f.unread, 0);
