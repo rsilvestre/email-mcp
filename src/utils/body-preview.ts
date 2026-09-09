@@ -183,6 +183,7 @@ interface StructureNode {
   part?: string;
   type?: string;
   encoding?: string;
+  disposition?: string;
   parameters?: { charset?: string };
   childNodes?: StructureNode[];
 }
@@ -216,6 +217,48 @@ export function findPreviewPart(bodyStructure: unknown): PreviewPart | undefined
 
   const nested = first.childNodes?.find((child) => child.part === '1.1');
   return nested ? toPart(nested, '1.1') : undefined;
+}
+
+/** The body parts a full message read should fetch. */
+export interface BodyTextParts {
+  plain?: PreviewPart;
+  html?: PreviewPart;
+}
+
+/**
+ * Locate the message body among the MIME parts.
+ *
+ * Unlike findPreviewPart, which only ever looks at sections 1 and 1.1, this
+ * walks the whole structure: the readable body of a multipart/mixed sits beside
+ * its attachments, and multipart/related nests it another level down.
+ *
+ * Parts marked as attachments are skipped — an attached .txt or .html is a file
+ * the caller may download by name, not the text of the message.
+ */
+export function findBodyTextParts(bodyStructure: unknown): BodyTextParts {
+  const found: BodyTextParts = {};
+  if (!bodyStructure || typeof bodyStructure !== 'object') return found;
+
+  const visit = (node: StructureNode, sectionKey: string): void => {
+    if (node.childNodes?.length) {
+      node.childNodes.forEach((child) => {
+        visit(child, child.part ?? sectionKey);
+      });
+      return;
+    }
+    if (node.disposition === 'attachment') return;
+
+    // A single-part message has no part number; its body is section 1.
+    const key = node.part ?? sectionKey;
+    if (node.type === 'text/plain' && !found.plain) {
+      found.plain = toPart(node, key);
+    } else if (node.type === 'text/html' && !found.html) {
+      found.html = toPart(node, key);
+    }
+  };
+
+  visit(bodyStructure as StructureNode, '1');
+  return found;
 }
 
 /** Decode a fetched part into a one-line preview, or undefined if it is empty. */

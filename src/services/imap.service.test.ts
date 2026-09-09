@@ -19,6 +19,8 @@ function createMockImapClient() {
     messageFlagsAdd: vi.fn().mockResolvedValue(true),
     messageFlagsRemove: vi.fn().mockResolvedValue(true),
     append: vi.fn().mockResolvedValue({ uid: 42 }),
+    fetchOne: vi.fn().mockResolvedValue(undefined),
+    download: vi.fn().mockResolvedValue(undefined),
     capabilities: new Set<string>(),
     _releaseFn: releaseFn,
   };
@@ -321,5 +323,174 @@ describe('ImapService', () => {
 
       expect(client.append).not.toHaveBeenCalled();
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getEmail body retrieval
+// ---------------------------------------------------------------------------
+
+describe('ImapService.getEmail body retrieval', () => {
+  let client: ReturnType<typeof createMockImapClient>;
+  let service: ImapService;
+
+  /** A downloaded part, shaped the way imapflow returns one. */
+  function downloadedPart(body: string) {
+    const buffer = Buffer.from(body, 'utf-8');
+    async function* streamPart() {
+      yield buffer;
+    }
+    return { content: streamPart() };
+  }
+
+  const headerBlock = Buffer.from(
+    ['From: sender@example.com', 'Subject: Devis', 'References: <a@x> <b@x>', ''].join('\r\n'),
+  );
+
+  function respondWith(bodyStructure: unknown) {
+    client.fetchOne.mockResolvedValue({
+      uid: 7,
+      envelope: { messageId: '<c@x>', cc: [], bcc: [] },
+      flags: new Set<string>(),
+      bodyStructure,
+      headers: headerBlock,
+    });
+  }
+
+  beforeEach(() => {
+    client = createMockImapClient();
+    service = new ImapService(createMockConnectionManager(client));
+  });
+
+  it('fetches headers rather than the whole message', async () => {
+    respondWith({ type: 'text/plain', encoding: '7bit' });
+    client.download.mockResolvedValue(downloadedPart('bonjour'));
+
+    await service.getEmail('test', '7', 'INBOX');
+
+    const fetchOptions = client.fetchOne.mock.calls[0]?.[1] as Record<string, unknown>;
+    // BODY.PEEK[] would drag every attachment down to display the text.
+    expect(fetchOptions.source).toBeUndefined();
+    expect(fetchOptions.headers).toBe(true);
+    expect(fetchOptions.bodyStructure).toBe(true);
+  });
+
+  it('downloads the body exactly once', async () => {
+    respondWith({
+      type: 'multipart/mixed',
+      childNodes: [
+        { part: '1', type: 'text/plain', encoding: '7bit' },
+        { part: '2', type: 'application/pdf', disposition: 'attachment' },
+      ],
+    });
+    client.download.mockResolvedValue(downloadedPart('le devis est joint'));
+
+    const email = await service.getEmail('test', '7', 'INBOX');
+
+    // The body used to be parsed out of the full source and then downloaded
+    // again unconditionally, so every read paid for two overlapping transfers.
+    expect(client.download).toHaveBeenCalledTimes(1);
+    expect(client.download.mock.calls[0]?.[1]).toBe('1');
+    expect(email.bodyText).toBe('le devis est joint');
+  });
+
+  it('does not mistake the attachment for the body', async () => {
+    respondWith({
+      type: 'multipart/mixed',
+      childNodes: [
+        { part: '1', type: 'text/plain', encoding: '7bit' },
+        { part: '2', type: 'text/plain', encoding: 'base64', disposition: 'attachment' },
+      ],
+    });
+    client.download.mockResolvedValue(downloadedPart('message'));
+
+    await service.getEmail('test', '7', 'INBOX');
+
+    expect(client.download.mock.calls[0]?.[1]).toBe('1');
+  });
+
+  it('prefers the plain alternative over the HTML one', async () => {
+    respondWith({
+      type: 'multipart/alternative',
+      childNodes: [
+        { part: '1', type: 'text/plain', encoding: '7bit' },
+        { part: '2', type: 'text/html', encoding: '7bit' },
+      ],
+    });
+    client.download.mockResolvedValue(downloadedPart('version texte'));
+
+    const email = await service.getEmail('test', '7', 'INBOX');
+
+    expect(client.download).toHaveBeenCalledTimes(1);
+    expect(email.bodyText).toBe('version texte');
+    expect(email.bodyHtml).toBeUndefined();
+  });
+
+  it('reports an HTML-only body as HTML', async () => {
+    respondWith({ type: 'text/html', encoding: '7bit' });
+    client.download.mockResolvedValue(downloadedPart('<p>bonjour</p>'));
+
+    const email = await service.getEmail('test', '7', 'INBOX');
+
+    // Assigning this to bodyText, as the old path did, defeated format:'text' —
+    // it had no way to know the content needed stripping.
+    expect(email.bodyHtml).toBe('<p>bonjour</p>');
+    expect(email.bodyText).toBeUndefined();
+  });
+
+  it('decodes base64 in a non-UTF-8 charset', async () => {
+    respondWith({
+      type: 'text/plain',
+      encoding: 'base64',
+      parameters: { charset: 'iso-8859-1' },
+    });
+    client.download.mockResolvedValue(
+      downloadedPart(Buffer.from('café crème', 'latin1').toString('base64')),
+    );
+
+    const email = await service.getEmail('test', '7', 'INBOX');
+
+    expect(email.bodyText).toBe('café crème');
+  });
+
+  it('decodes quoted-printable', async () => {
+    respondWith({ type: 'text/plain', encoding: 'quoted-printable' });
+    client.download.mockResolvedValue(downloadedPart('caf=C3=A9 =\r\ncr=C3=A8me'));
+
+    const email = await service.getEmail('test', '7', 'INBOX');
+
+    expect(email.bodyText).toBe('café crème');
+  });
+
+  it('skips the download when the message has no text part', async () => {
+    respondWith({
+      type: 'multipart/mixed',
+      childNodes: [{ part: '1', type: 'application/pdf', disposition: 'attachment' }],
+    });
+
+    const email = await service.getEmail('test', '7', 'INBOX');
+
+    expect(client.download).not.toHaveBeenCalled();
+    expect(email.bodyText).toBeUndefined();
+    expect(email.attachments).toHaveLength(1);
+  });
+
+  it('still returns the message when the body download fails', async () => {
+    respondWith({ type: 'text/plain', encoding: '7bit' });
+    client.download.mockRejectedValue(new Error('NO [CANNOT] Invalid section'));
+
+    const email = await service.getEmail('test', '7', 'INBOX');
+
+    expect(email.bodyText).toBeUndefined();
+    expect(email.headers.subject).toBe('Devis');
+  });
+
+  it('reads References from the unfolded header block', async () => {
+    respondWith({ type: 'text/plain', encoding: '7bit' });
+    client.download.mockResolvedValue(downloadedPart('x'));
+
+    const email = await service.getEmail('test', '7', 'INBOX');
+
+    expect(email.references).toEqual(['<a@x>', '<b@x>']);
   });
 });

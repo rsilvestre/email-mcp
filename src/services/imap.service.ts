@@ -29,7 +29,15 @@ import type {
   QuotaInfo,
   SenderStat,
 } from '../types/index.js';
-import { buildPreview, findPreviewPart, PREVIEW_PART_BYTES } from '../utils/body-preview.js';
+import type { BodyTextParts, PreviewPart } from '../utils/body-preview.js';
+import {
+  buildPreview,
+  decodeCharset,
+  decodeTransferEncoding,
+  findBodyTextParts,
+  findPreviewPart,
+  PREVIEW_PART_BYTES,
+} from '../utils/body-preview.js';
 import { BULK_HEADER_FIELDS, classifyBulk, parseHeaderBlock } from '../utils/bulk-headers.js';
 import { buildRawMessage, resolveAttachments } from '../utils/mail-attachments.js';
 import type { LabelStrategy } from './label-strategy.js';
@@ -229,6 +237,58 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
   };
 }
 
+/**
+ * Read one text part off the wire and decode it.
+ *
+ * Returns undefined rather than throwing: a structure can name a section the
+ * server then refuses, and a message with an unreadable body is still worth
+ * returning with its headers intact.
+ */
+async function downloadTextPart(
+  client: ImapFlow,
+  uid: number,
+  part: PreviewPart,
+): Promise<string | undefined> {
+  try {
+    const downloaded = await client.download(String(uid), part.key, { uid: true });
+    if (!downloaded?.content) return undefined;
+
+    const chunks: Buffer[] = [];
+    // eslint-disable-next-line no-restricted-syntax
+    for await (const chunk of downloaded.content) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return decodeCharset(
+      decodeTransferEncoding(Buffer.concat(chunks), part.encoding),
+      part.charset,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Fetch the readable body, preferring the plain-text alternative.
+ *
+ * Only one part is fetched. Downloading both alternatives would cost an extra
+ * round trip per message for a second copy of the same content: every consumer
+ * reads `bodyText ?? bodyHtml`, so the one the sender wrote for humans is the
+ * one worth having.
+ */
+async function fetchBody(
+  client: ImapFlow,
+  uid: number,
+  parts: BodyTextParts,
+): Promise<{ bodyText?: string; bodyHtml?: string }> {
+  if (parts.plain) {
+    return { bodyText: await downloadTextPart(client, uid, parts.plain) };
+  }
+  if (parts.html) {
+    return { bodyHtml: await downloadTextPart(client, uid, parts.html) };
+  }
+  return {};
+}
+
 async function messageToEmail(
   msg: Record<string, unknown>,
   client: ImapFlow,
@@ -237,44 +297,20 @@ async function messageToEmail(
   const meta = messageToEmailMeta(msg);
   const envelope = (msg.envelope ?? {}) as Record<string, unknown>;
 
-  // Parse full source for body content
-  let bodyText: string | undefined;
-  let bodyHtml: string | undefined;
+  // Headers come from BODY.PEEK[HEADER]; parseHeaderBlock unfolds RFC 5322
+  // continuation lines, which naive line splitting truncates on fields such as
+  // List-Unsubscribe.
   const headers: Record<string, string> = {};
-
-  if (msg.source && Buffer.isBuffer(msg.source)) {
-    const raw = msg.source.toString('utf-8');
-    const headerEnd = raw.indexOf('\r\n\r\n');
-    if (headerEnd >= 0) {
-      // parseHeaderBlock unfolds RFC 5322 continuation lines; naive line
-      // splitting truncates folded fields such as List-Unsubscribe.
-      Object.assign(headers, parseHeaderBlock(raw.slice(0, headerEnd)));
-
-      const body = raw.slice(headerEnd + 4);
-      // Simple content type detection
-      const contentType = headers['content-type'] ?? '';
-      if (contentType.includes('text/html')) {
-        bodyHtml = body;
-      } else {
-        bodyText = body;
-      }
-    }
+  if (msg.headers && Buffer.isBuffer(msg.headers)) {
+    Object.assign(headers, parseHeaderBlock(msg.headers.toString('utf-8')));
   }
 
-  // Try to get text/html parts via download if body parsing was simple
-  try {
-    const textPart = await client.download(String(uid), '1', { uid: true });
-    if (textPart?.content) {
-      const chunks: Buffer[] = [];
-      // eslint-disable-next-line no-restricted-syntax
-      for await (const chunk of textPart.content) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      bodyText = Buffer.concat(chunks).toString('utf-8');
-    }
-  } catch {
-    // Part may not exist
-  }
+  // The body is fetched by MIME section rather than sliced out of the full
+  // source. Slicing at the header boundary hands back the raw multipart body —
+  // boundaries, base64 attachments and all — whenever the message is not a bare
+  // text/plain, which is why this used to be papered over by unconditionally
+  // re-downloading section 1 afterwards.
+  const { bodyText, bodyHtml } = await fetchBody(client, uid, findBodyTextParts(msg.bodyStructure));
 
   return {
     ...meta,
@@ -514,7 +550,10 @@ export default class ImapService {
           envelope: true,
           flags: true,
           bodyStructure: true,
-          source: true,
+          // BODY.PEEK[HEADER], not BODY.PEEK[]. Fetching the whole message
+          // pulled every attachment down to display its text, and `maxLength`
+          // trims the output afterwards rather than the bytes.
+          headers: true,
         },
         { uid: true },
       );
@@ -1509,7 +1548,8 @@ export default class ImapService {
       if (rootUids.length > 0) {
         const rootMsg = await client.fetchOne(
           String(rootUids[0]),
-          { uid: true, envelope: true, source: true },
+          // Only the References header is read below, so do not pull the body.
+          { uid: true, envelope: true, headers: true },
           { uid: true },
         );
 
@@ -1519,18 +1559,17 @@ export default class ImapService {
           const inReplyTo = envelope.inReplyTo as string | undefined;
           if (inReplyTo) targetMsgIds.add(inReplyTo);
 
-          // Parse References header from source
-          if (raw.source && Buffer.isBuffer(raw.source)) {
-            const src = raw.source.toString('utf-8');
-            const refMatch = /^References:\s*(.+?)(?:\r?\n(?!\s))/ms.exec(src);
-            if (refMatch) {
-              refMatch[1]
-                .split(/\s+/)
-                .filter(Boolean)
-                .forEach((ref) => {
-                  targetMsgIds.add(ref);
-                });
-            }
+          // References comes from the fetched header block. parseHeaderBlock
+          // unfolds continuation lines, so a long reference chain wrapped over
+          // several lines is read whole rather than cut at the first newline.
+          if (raw.headers && Buffer.isBuffer(raw.headers)) {
+            const rootHeaders = parseHeaderBlock(raw.headers.toString('utf-8'));
+            rootHeaders.references
+              ?.split(/\s+/)
+              .filter(Boolean)
+              .forEach((ref) => {
+                targetMsgIds.add(ref);
+              });
           }
         }
       }
@@ -1607,7 +1646,7 @@ export default class ImapService {
           envelope: true,
           flags: true,
           bodyStructure: true,
-          source: true,
+          headers: true,
         },
         { uid: true },
       )) {
