@@ -403,3 +403,46 @@ describe('findBodyTextParts', () => {
     expect(findBodyTextParts('not a structure')).toEqual({});
   });
 });
+
+describe('decodeCharset with a mislabelled charset', () => {
+  /** UTF-8 bytes for text a sender then declares as Windows-1252. */
+  const utf8Bytes = Buffer.from('Oh je suis un peu confuse de votre départ', 'utf-8');
+
+  // Real mail does this: Outlook declaring Windows-1252 while sending UTF-8.
+  // Honouring the label turns every accent into mojibake.
+  it('trusts the bytes when they are valid UTF-8', () => {
+    expect(decodeCharset(utf8Bytes, 'Windows-1252')).toBe(
+      'Oh je suis un peu confuse de votre départ',
+    );
+  });
+
+  it('still honours a charset the bytes agree with', () => {
+    // 0xE9 is "é" in Windows-1252 and not valid UTF-8, so the label stands.
+    const latinBytes = Buffer.from('caf\xe9 cr\xe8me', 'latin1');
+
+    expect(decodeCharset(latinBytes, 'windows-1252')).toBe('café crème');
+  });
+
+  it('leaves iso-8859-1 alone', () => {
+    const latinBytes = Buffer.from('r\xe9sili\xe9', 'latin1');
+
+    expect(decodeCharset(latinBytes, 'iso-8859-1')).toBe('résilié');
+  });
+
+  it('does not second-guess pure ASCII', () => {
+    const ascii = Buffer.from('plain text', 'utf-8');
+
+    expect(decodeCharset(ascii, 'windows-1252')).toBe('plain text');
+  });
+
+  // Previews stop at a byte count, so the last character is routinely cut.
+  it('recognises UTF-8 whose last character was truncated', () => {
+    const cut = Buffer.from('départ café', 'utf-8').subarray(0, 12);
+
+    expect(decodeCharset(cut, 'Windows-1252')).toContain('départ');
+  });
+
+  it('keeps working when the label is one TextDecoder rejects', () => {
+    expect(decodeCharset(utf8Bytes, 'x-unknown-charset')).toContain('départ');
+  });
+});

@@ -102,14 +102,65 @@ export function decodeTransferEncoding(raw: Buffer, encoding: string | undefined
   }
 }
 
+/** Charset labels that already mean UTF-8, so the sniff below is pointless. */
+const UTF8_LABELS = new Set(['utf-8', 'utf8', 'unicode-1-1-utf-8', 'csutf8']);
+
 /**
- * Decode bytes with the part's declared charset.
+ * Drop a trailing UTF-8 sequence the fetch cut in half.
  *
- * `fatal: false` matters: the fetch cuts the body mid-character often enough
- * that a strict decoder would throw on ordinary mail.
+ * Previews stop at a byte count rather than a character boundary, so the last
+ * one to three bytes are routinely an incomplete sequence. Testing the buffer
+ * for valid UTF-8 without trimming them would fail on perfectly good UTF-8.
+ */
+function withoutTruncatedSequence(buffer: Buffer): Buffer {
+  for (let back = 1; back <= 3 && back <= buffer.length; back += 1) {
+    const byte = buffer[buffer.length - back];
+    // A lead byte this close to the end has no room for its continuation bytes.
+    if (byte >= 0xc0) return buffer.subarray(0, buffer.length - back);
+    if (byte < 0x80) break; // ASCII: nothing was cut.
+  }
+  return buffer;
+}
+
+/**
+ * Does this look like UTF-8 regardless of what the sender called it?
+ *
+ * Real mail mislabels its charset often — Outlook in particular declares
+ * Windows-1252 while sending UTF-8 — and decoding those bytes as declared
+ * turns every accented character into mojibake.
+ *
+ * Multi-byte UTF-8 sequences are structurally constrained, so genuine
+ * Windows-1252 text almost never forms valid ones by chance: "é" in
+ * Windows-1252 is a single 0xE9 byte, which is not valid UTF-8 at all. A high
+ * byte plus a clean strict decode is therefore strong evidence.
+ */
+function looksLikeUtf8(buffer: Buffer): boolean {
+  const testable = withoutTruncatedSequence(buffer);
+  // Pure ASCII decodes identically either way, so there is nothing to correct.
+  if (!testable.some((byte) => byte >= 0x80)) return false;
+
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(testable);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Decode bytes with the part's declared charset, unless the bytes say otherwise.
+ *
+ * `fatal: false` matters for the final decode: the fetch cuts the body
+ * mid-character often enough that a strict decoder would throw on ordinary mail.
  */
 export function decodeCharset(buffer: Buffer, charset: string | undefined): string {
   const label = (charset ?? 'utf-8').toLowerCase();
+
+  // Trust the bytes over the label where they disagree.
+  if (!UTF8_LABELS.has(label) && looksLikeUtf8(buffer)) {
+    return new TextDecoder('utf-8', { fatal: false }).decode(buffer);
+  }
+
   try {
     return new TextDecoder(label, { fatal: false }).decode(buffer);
   } catch {
